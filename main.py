@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 import importlib.util
 import os
 
-# 🔥 QDRANT SERVICE
+# ?? QDRANT SERVICE
 from services.qdrant_service import qdrant_service
 
 
@@ -19,13 +19,13 @@ def _has_module(name: str) -> bool:
 
 def _load_optional_router(module_name: str, attr: str = "router"):
     if not _has_module(module_name):
-        print(f"⚠️ Skipping {module_name} (not found)")
+        print(f"?? Skipping {module_name} (not found)")
         return None
     try:
         module = __import__(module_name, fromlist=[attr])
         return getattr(module, attr)
     except Exception as exc:
-        print(f"❌ {module_name} failed: {exc}")
+        print(f"? {module_name} failed: {exc}")
         return None
 
 
@@ -48,7 +48,7 @@ reddit_router = _load_optional_router("routers.reddit")
 # Feature-based
 bg_router = None
 if os.getenv("ENABLE_BG_REMOVER", "false").lower() in ("1", "true", "yes"):
-    if all(_has_module(m) for m in ["transformers", "torch", "torchvision", "PIL"]):
+    if all(_has_module(m) for m in ["transformers", "torch", "PIL"]):
         bg_router = _load_optional_router("routers.bg_remover")
 
 vision_router = None
@@ -202,6 +202,8 @@ if reddit_router:
 
 if vision_router:
     app.include_router(vision_router, prefix="/api/vision")
+    # Backward-compatible alias for older clients still using /api/analyze-image.
+    app.include_router(vision_router, prefix="/api")
 if wardrobe_capture_router:
     app.include_router(wardrobe_capture_router)
 
@@ -215,6 +217,46 @@ if garment_router:
 # -------------------------
 # HEALTH
 # -------------------------
+
+# -------------------------
+# BG REMOVE COMPAT ROUTES
+# -------------------------
+@app.post("/api/background/remove-bg")
+@app.post("/api/remove-bg")
+async def remove_bg_compat(payload: dict):
+    """
+    Always expose background-removal endpoint even when optional router gating
+    prevents router mounting. This keeps frontend flow stable.
+    """
+    image_base64 = (payload or {}).get("image_base64", "")
+    if not image_base64:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    try:
+        from routers.bg_remover import BGRemoveRequest, remove_background
+    except Exception as exc:
+        # Return a hard failure so clients do not treat this as a successful cutout.
+        raise HTTPException(
+            status_code=503,
+            detail=f"BG remover unavailable: {exc}",
+        )
+
+    req = BGRemoveRequest(image_base64=image_base64)
+    result = await remove_background(req)
+    if isinstance(result, dict):
+        print(
+            "BG compat result:",
+            {
+                "bg_removed": result.get("bg_removed"),
+                "fallback_reason": result.get("fallback_reason"),
+            },
+        )
+        if result.get("bg_removed") is not True:
+            raise HTTPException(
+                status_code=503,
+                detail=result.get("fallback_reason") or "Background removal failed",
+            )
+    return result
 @app.get("/")
 def root():
     return {"message": "AHVI backend running"}

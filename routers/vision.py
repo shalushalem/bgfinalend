@@ -1,10 +1,11 @@
-﻿import json
+import json
 import re
 import base64
+import os
+import asyncio
 import cv2
 import numpy as np
 import requests
-import uuid
 
 from collections import Counter
 from fastapi import APIRouter, HTTPException, status
@@ -22,18 +23,129 @@ name, category, sub_category, occasions, pattern.
 Do not include markdown fences or extra text.
 """
 from services.embedding_service import encode_metadata
+from services.image_embedding_service import encode_image_base64
+from services.image_fingerprint import compute_pixel_hash_from_base64
 from services.qdrant_service import qdrant_service
 try:
     from worker import vision_analyze_task
 except Exception:
     vision_analyze_task = None
+try:
+    from routers.bg_remover import BGRemoveRequest, remove_background
+except Exception:
+    BGRemoveRequest = None
+    remove_background = None
 
 router = APIRouter()
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api").rstrip("/")
+VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision:latest")
+VISION_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_VISION_TIMEOUT_SECONDS", "120"))
+VISION_MODEL_FALLBACKS = [
+    m.strip()
+    for m in os.getenv(
+        "OLLAMA_VISION_MODEL_FALLBACKS",
+        "llama3.2-vision:latest,llama3.2-vision",
+    ).split(",")
+    if m.strip()
+]
+
+
+def _duplicate_threshold() -> float:
+    raw = str(os.getenv("WARDROBE_DUPLICATE_THRESHOLD", "0.97") or "").strip()
+    try:
+        value = float(raw)
+        if value <= 0.0:
+            return 0.97
+        if value > 1.0:
+            return 1.0
+        return value
+    except Exception:
+        return 0.97
+
+
+def _pixel_duplicate_distance() -> int:
+    raw = str(os.getenv("WARDROBE_PIXEL_DUPLICATE_DISTANCE", "6") or "").strip()
+    try:
+        value = int(raw)
+        if value < 0:
+            return 0
+        if value > 64:
+            return 64
+        return value
+    except Exception:
+        return 6
+
+
+def _image_duplicate_threshold() -> float:
+    raw = str(os.getenv("WARDROBE_IMAGE_DUPLICATE_THRESHOLD", "0.985") or "").strip()
+    try:
+        value = float(raw)
+        if value <= 0.0:
+            return 0.985
+        if value > 1.0:
+            return 1.0
+        return value
+    except Exception:
+        return 0.985
+
+
+def _ollama_generate_url() -> str:
+    return f"{OLLAMA_URL}/generate" if OLLAMA_URL.endswith("/api") else f"{OLLAMA_URL}/api/generate"
+
+
+def _vision_model_candidates():
+    ordered = []
+    for model in [VISION_MODEL, *VISION_MODEL_FALLBACKS]:
+        m = str(model or "").strip()
+        if m and m not in ordered:
+            ordered.append(m)
+    return ordered
 
 
 class ImageAnalyzeRequest(BaseModel):
     image_base64: str = Field(..., min_length=20)
     userId: str = "demo_user"
+
+
+def _normalize_base64_for_model(value: str) -> str:
+    text = (value or "").strip()
+    if "," in text:
+        return text.split(",", 1)[1]
+    return text
+
+
+def _to_png_data_uri(base64_text: str) -> str:
+    text = _normalize_base64_for_model(base64_text)
+    return f"data:image/png;base64,{text}"
+
+
+def _input_has_alpha(image_base64: str) -> bool:
+    try:
+        b64 = _normalize_base64_for_model(image_base64)
+        img_data = base64.b64decode(b64, validate=True)
+        np_arr = np.frombuffer(img_data, np.uint8)
+        decoded = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+        return bool(decoded is not None and decoded.ndim == 3 and decoded.shape[2] == 4)
+    except Exception:
+        return False
+
+
+def _remove_bg_first(image_base64: str):
+    if _input_has_alpha(image_base64):
+        return image_base64, True, "input_already_has_alpha"
+    if BGRemoveRequest is None or remove_background is None:
+        return image_base64, False, "bg_remover_unavailable"
+    try:
+        req = BGRemoveRequest(image_base64=image_base64)
+        result = asyncio.run(remove_background(req))
+        if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
+            processed = _to_png_data_uri(result.get("image_base64"))
+            bg_removed = bool(result.get("bg_removed", True))
+            return processed, bg_removed, result.get("fallback_reason")
+        return image_base64, False, "bg_remove_no_image"
+    except Exception as exc:
+        print(f"BG remove before vision failed: {exc}")
+        return image_base64, False, f"bg_remove_failed: {exc}"
 
 
 def _hex_to_color_name(hex_color: str) -> str:
@@ -239,13 +351,16 @@ def get_dominant_color(cv_image, k=3):
 # -------------------------
 @router.post("/analyze-image")
 def analyze_image(request: ImageAnalyzeRequest):
+    # -------------------------
+    # STEP 0: BG REMOVAL FIRST
+    # -------------------------
+    vision_input_base64, bg_removed, bg_fallback_reason = _remove_bg_first(request.image_base64)
+    print("Vision preprocess BG:", {"bg_removed": bg_removed, "reason": bg_fallback_reason})
 
     # -------------------------
     # STEP 1: Decode + Color
     # -------------------------
-    base64_data = request.image_base64
-    if "," in base64_data:
-        base64_data = base64_data.split(",", 1)[1]
+    base64_data = _normalize_base64_for_model(vision_input_base64)
 
     try:
         img_data = base64.b64decode(base64_data, validate=True)
@@ -278,25 +393,45 @@ def analyze_image(request: ImageAnalyzeRequest):
     # STEP 2: LLM ANALYSIS
     # -------------------------
     payload = {
-        "model": "llama3.2-vision",
+        "model": VISION_MODEL,
         "prompt": getattr(prompts, "VISION_ANALYZE_PROMPT", DEFAULT_VISION_ANALYZE_PROMPT),
-        "images": [request.image_base64],
+        "images": [_normalize_base64_for_model(vision_input_base64)],
         "stream": False,
         "format": "json",
     }
 
     llm_fallback = False
+    model_used = None
     try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json=payload,
-            timeout=35,
-        )
-        response.raise_for_status()
+        last_error = None
+        final_data = None
 
-        raw_response = response.json().get("response", "{}")
-        clean_response = re.sub(r"```json|```", "", raw_response).strip()
-        final_data = json.loads(clean_response)
+        for model_name in _vision_model_candidates():
+            try:
+                local_payload = dict(payload)
+                local_payload["model"] = model_name
+                response = requests.post(
+                    _ollama_generate_url(),
+                    json=local_payload,
+                    timeout=VISION_TIMEOUT_SECONDS,
+                )
+                if response.status_code >= 400:
+                    body = (response.text or "").strip()
+                    raise RuntimeError(
+                        f"Ollama generate failed for model='{model_name}' "
+                        f"status={response.status_code} body={body[:240]}"
+                    )
+                raw_response = response.json().get("response", "{}")
+                clean_response = re.sub(r"```json|```", "", raw_response).strip()
+                final_data = json.loads(clean_response)
+                model_used = model_name
+                break
+            except Exception as inner_exc:
+                last_error = inner_exc
+                continue
+
+        if final_data is None:
+            raise RuntimeError(last_error or "vision generation failed")
 
     except Exception as e:
         print(f"Image Analyze Error: {str(e)}")
@@ -343,17 +478,64 @@ def analyze_image(request: ImageAnalyzeRequest):
     final_data["userId"] = request.userId
 
     # -------------------------
-    # STEP 4: EMBEDDING + STORAGE
+    # STEP 4: EMBEDDING + SIMILARITY CHECK
     # -------------------------
-    qdrant_saved = False
+    vector = None
+    similar_items = []
     try:
         vector = encode_metadata(final_data)
-        item_id = str(uuid.uuid4())
-        qdrant_service.upsert_item(item_id=item_id, vector=vector, payload=final_data)
-        qdrant_saved = True
-        print("Stored in Qdrant:", item_id)
+        similar_items = qdrant_service.search_similar(vector, request.userId, limit=5)
     except Exception as e:
-        print("Qdrant store error:", str(e))
+        print("Qdrant similarity search error:", str(e))
+
+    image_vector = encode_image_base64(vision_input_base64)
+    image_duplicate = {
+        "checked": False,
+        "is_duplicate": False,
+        "id": None,
+        "score": 0.0,
+    }
+    image_duplicate_threshold = _image_duplicate_threshold()
+    if image_vector:
+        try:
+            image_duplicate = qdrant_service.find_image_duplicate(
+                image_vector,
+                request.userId,
+                threshold=image_duplicate_threshold,
+            )
+        except Exception as e:
+            print("Qdrant image duplicate check error:", str(e))
+
+    pixel_hash = compute_pixel_hash_from_base64(vision_input_base64)
+    pixel_duplicate = {
+        "checked": False,
+        "is_duplicate": False,
+        "id": None,
+        "distance": None,
+    }
+    pixel_max_distance = _pixel_duplicate_distance()
+    if pixel_hash:
+        try:
+            pixel_duplicate = qdrant_service.find_pixel_duplicate(
+                request.userId,
+                pixel_hash,
+                max_distance=pixel_max_distance,
+            )
+        except Exception as e:
+            print("Qdrant pixel duplicate check error:", str(e))
+
+    duplicate_threshold = _duplicate_threshold()
+    top_similarity_score = 0.0
+    if similar_items:
+        try:
+            top_similarity_score = float(similar_items[0].get("score") or 0.0)
+        except Exception:
+            top_similarity_score = 0.0
+    probable_duplicate = bool(
+        image_duplicate.get("is_duplicate")
+        or pixel_duplicate.get("is_duplicate")
+        or top_similarity_score >= duplicate_threshold
+    )
 
     # -------------------------
     # RESPONSE
@@ -361,9 +543,31 @@ def analyze_image(request: ImageAnalyzeRequest):
     return {
         "success": True,
         "data": final_data,
+        "processed_image_base64": vision_input_base64,
+        "similar_items": similar_items,
         "meta": {
-            "qdrant_saved": qdrant_saved,
+            "bg_removed_first": True,
+            "bg_removed": bg_removed,
+            "bg_fallback_reason": bg_fallback_reason,
             "llm_fallback": llm_fallback,
+            "vision_model_used": model_used,
+            "embedding_created": vector is not None,
+            "similar_items_found": len(similar_items),
+            "duplicate_threshold": duplicate_threshold,
+            "top_similarity_score": top_similarity_score,
+            "image_vector_ready": bool(image_vector),
+            "image_duplicate_checked": bool(image_duplicate.get("checked")),
+            "image_duplicate_threshold": image_duplicate_threshold,
+            "image_duplicate_score": float(image_duplicate.get("score") or 0.0),
+            "image_duplicate_point_id": image_duplicate.get("id"),
+            "image_probable_duplicate": bool(image_duplicate.get("is_duplicate")),
+            "pixel_hash": pixel_hash or None,
+            "pixel_duplicate_checked": bool(pixel_duplicate.get("checked")),
+            "pixel_duplicate_distance": pixel_duplicate.get("distance"),
+            "pixel_duplicate_max_distance": pixel_max_distance,
+            "pixel_duplicate_point_id": pixel_duplicate.get("id"),
+            "pixel_probable_duplicate": bool(pixel_duplicate.get("is_duplicate")),
+            "probable_duplicate": probable_duplicate,
         },
     }
 
@@ -382,4 +586,3 @@ def analyze_image_async(request: ImageAnalyzeRequest):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue vision analysis: {exc}")
-

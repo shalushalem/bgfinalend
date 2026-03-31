@@ -4,13 +4,19 @@ import base64
 import torch
 import threading
 import numpy as np
+import cv2
 from collections import deque
-from PIL import Image
+from PIL import Image, ImageFilter
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, validator
 from transformers import AutoModelForImageSegmentation
-from torchvision import transforms
 from fastapi import status
+
+try:
+    from huggingface_hub import snapshot_download, login as hf_login
+except Exception:
+    snapshot_download = None
+    hf_login = None
 
 try:
     from worker import bg_remove_task
@@ -26,7 +32,6 @@ print("BG_REMOVER LOADED")
 
 router = APIRouter()
 
-
 class BGRemoveRequest(BaseModel):
     image_base64: str
 
@@ -36,7 +41,6 @@ class BGRemoveRequest(BaseModel):
             raise ValueError("Invalid image data")
         return v
 
-
 model = None
 model_last_error = None
 model_lock = threading.Lock()
@@ -45,8 +49,10 @@ onnx_session = None
 onnx_lock = threading.Lock()
 onnx_last_error = None
 onnx_runtime_disabled = False
-USE_TORCH_MODEL = os.getenv("BG_USE_TORCH_MODEL", "0") == "1"
+USE_TORCH_MODEL = os.getenv("BG_USE_TORCH_MODEL", "1") == "1"
 BG_DISABLE_ONNX = os.getenv("BG_DISABLE_ONNX", "1") == "1"
+BG_AUTO_DOWNLOAD = os.getenv("BG_AUTO_DOWNLOAD", "1") == "1"
+BG_HF_REPO_ID = os.getenv("BG_HF_REPO_ID", "briaai/RMBG-2.0")
 
 print(f"Using device: {device}")
 
@@ -64,12 +70,52 @@ ONNX_MODEL_CANDIDATES = [
 ]
 ONNX_INPUT_SIZES = [1024]
 
-transform_image = transforms.Compose([
-    transforms.Resize((1024, 1024)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
+def _to_model_input_tensor(image: Image.Image, side: int = 1024):
+    rgb = image.convert("RGB").resize((side, side), Image.BILINEAR)
+    arr = np.asarray(rgb).astype(np.float32) / 255.0
+    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
+        [0.229, 0.224, 0.225], dtype=np.float32
+    )
+    arr = np.transpose(arr, (2, 0, 1))[None, ...]
+    return torch.from_numpy(arr)
 
+def _model_assets_present(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    if not os.path.exists(os.path.join(path, "config.json")):
+        return False
+    candidates = [
+        "model.safetensors",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    ]
+    return any(os.path.exists(os.path.join(path, c)) for c in candidates)
+
+def _ensure_model_downloaded() -> str | None:
+    if _model_assets_present(MODEL_PATH):
+        return None
+    if not BG_AUTO_DOWNLOAD:
+        return f"Model not found at {MODEL_PATH} and BG_AUTO_DOWNLOAD=0"
+    if snapshot_download is None:
+        return "huggingface_hub is not installed; cannot download RMBG model"
+
+    try:
+        token = str(os.getenv("HF_TOKEN", "") or "").strip()
+        if token and hf_login is not None:
+            hf_login(token, add_to_git_credential=False)
+
+        print(f"Downloading model from {BG_HF_REPO_ID} to {MODEL_PATH} ...")
+        snapshot_download(
+            repo_id=BG_HF_REPO_ID,
+            local_dir=MODEL_PATH,
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:
+        return f"Model download failed: {exc}"
+
+    if not _model_assets_present(MODEL_PATH):
+        return f"Downloaded to {MODEL_PATH} but required weights not found"
+    return None
 
 def load_model():
     global model, model_last_error
@@ -85,6 +131,13 @@ def load_model():
 
         if not os.path.exists(MODEL_PATH):
             model_last_error = f"Model folder not found: {MODEL_PATH}"
+            print("Model load failed:", model_last_error)
+            model = None
+            return model
+
+        download_error = _ensure_model_downloaded()
+        if download_error:
+            model_last_error = download_error
             print("Model load failed:", model_last_error)
             model = None
             return model
@@ -125,7 +178,6 @@ def load_model():
 
     return model
 
-
 def load_onnx_session():
     global onnx_session, onnx_last_error, onnx_runtime_disabled
     if BG_DISABLE_ONNX:
@@ -148,7 +200,6 @@ def load_onnx_session():
             return None
 
         session_options = ort.SessionOptions()
-        # Keep graph rewrites off to avoid fusion-related init failures on some builds.
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         session_options.enable_cpu_mem_arena = True
         session_options.enable_mem_pattern = False
@@ -181,13 +232,13 @@ def load_onnx_session():
         print("ONNX load failed:", onnx_last_error)
         return None
 
-
 def _original_png_response(image_data: bytes, reason: str):
     try:
         original = Image.open(io.BytesIO(image_data)).convert("RGBA")
         buffer = io.BytesIO()
         original.save(buffer, format="PNG")
         result_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        print("BG original fallback:", reason)
         return {
             "success": True,
             "image_base64": result_base64,
@@ -196,107 +247,6 @@ def _original_png_response(image_data: bytes, reason: str):
         }
     except Exception:
         raise HTTPException(status_code=500, detail="Processing failed")
-
-
-def _white_bg_cutout_mask(orig_image: Image.Image):
-    arr = np.asarray(orig_image.convert("RGB"))
-    h, w, _ = arr.shape
-
-    maxc = arr.max(axis=2)
-    minc = arr.min(axis=2)
-    white = (
-        (arr[:, :, 0] >= 232)
-        & (arr[:, :, 1] >= 232)
-        & (arr[:, :, 2] >= 232)
-        & ((maxc - minc) <= 24)
-    )
-
-    visited = np.zeros((h, w), dtype=np.uint8)
-    q = deque()
-
-    for x in range(w):
-        if white[0, x]:
-            visited[0, x] = 1
-            q.append((0, x))
-        if white[h - 1, x]:
-            visited[h - 1, x] = 1
-            q.append((h - 1, x))
-    for y in range(h):
-        if white[y, 0]:
-            visited[y, 0] = 1
-            q.append((y, 0))
-        if white[y, w - 1]:
-            visited[y, w - 1] = 1
-            q.append((y, w - 1))
-
-    while q:
-        y, x = q.popleft()
-        if y + 1 < h and not visited[y + 1, x] and white[y + 1, x]:
-            visited[y + 1, x] = 1
-            q.append((y + 1, x))
-        if y - 1 >= 0 and not visited[y - 1, x] and white[y - 1, x]:
-            visited[y - 1, x] = 1
-            q.append((y - 1, x))
-        if x + 1 < w and not visited[y, x + 1] and white[y, x + 1]:
-            visited[y, x + 1] = 1
-            q.append((y, x + 1))
-        if x - 1 >= 0 and not visited[y, x - 1] and white[y, x - 1]:
-            visited[y, x - 1] = 1
-            q.append((y, x - 1))
-
-    return 255 - (visited.astype(np.uint8) * 255)
-
-
-def _best_effort_png_response(image_data: bytes, reason: str):
-    try:
-        orig = Image.open(io.BytesIO(image_data)).convert("RGB")
-        fg_mask = _white_bg_cutout_mask(orig)
-
-        fg_pixels = int((fg_mask > 0).sum())
-        total = fg_mask.size
-        if fg_pixels < int(total * 0.02) or fg_pixels > int(total * 0.98):
-            return _original_png_response(image_data, reason)
-
-        alpha = Image.fromarray(fg_mask)
-        out = orig.copy()
-        out.putalpha(alpha)
-
-        buffer = io.BytesIO()
-        out.save(buffer, format="PNG")
-        result_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return {
-            "success": True,
-            "image_base64": result_base64,
-            "bg_removed": True,
-            "fallback_reason": f"Used white-background heuristic cutout: {reason}",
-        }
-    except Exception:
-        return _original_png_response(image_data, reason)
-
-
-def _is_likely_white_background(orig_image: Image.Image):
-    arr = np.asarray(orig_image.convert("RGB"))
-    h, w, _ = arr.shape
-    if h < 8 or w < 8:
-        return False
-
-    maxc = arr.max(axis=2)
-    minc = arr.min(axis=2)
-    white = (
-        (arr[:, :, 0] >= 232)
-        & (arr[:, :, 1] >= 232)
-        & (arr[:, :, 2] >= 232)
-        & ((maxc - minc) <= 24)
-    )
-
-    border_mask = np.zeros((h, w), dtype=bool)
-    border_mask[0, :] = True
-    border_mask[h - 1, :] = True
-    border_mask[:, 0] = True
-    border_mask[:, w - 1] = True
-    border_white_ratio = float((white & border_mask).sum()) / float(border_mask.sum())
-    return border_white_ratio >= 0.55
-
 
 @router.post("/remove-bg")
 async def remove_background(request: BGRemoveRequest):
@@ -324,17 +274,13 @@ async def remove_background(request: BGRemoveRequest):
             if onnx_last_error:
                 detail = f"{detail} | ONNX fallback failed: {onnx_last_error}"
             print("BG fallback to original:", detail)
-            return _best_effort_png_response(image_data, detail)
+            return _original_png_response(image_data, detail)
 
         orig_image = Image.open(io.BytesIO(image_data)).convert("RGB")
         w, h = orig_image.size
 
-        # Fast path for catalog/demo style images: avoid heavy ONNX when white BG is obvious.
-        if model_instance is None and _is_likely_white_background(orig_image):
-            return _best_effort_png_response(image_data, "fast white-background heuristic")
-
         if model_instance is not None:
-            input_tensor = transform_image(orig_image).unsqueeze(0).to(device)
+            input_tensor = _to_model_input_tensor(orig_image).to(device)
             with torch.no_grad():
                 preds = model_instance(input_tensor)[-1].sigmoid().cpu()
             mask = preds[0].squeeze().numpy()
@@ -342,8 +288,6 @@ async def remove_background(request: BGRemoveRequest):
             input_name = onnx_instance.get_inputs()[0].name
             input_shape = onnx_instance.get_inputs()[0].shape
 
-            # RMBG ONNX decoders are often exported with a hard 1024 spatial assumption.
-            # Running at smaller resolutions triggers Split_64 shape errors.
             fixed_side = 1024
             if len(input_shape) >= 4:
                 maybe_h = input_shape[-2]
@@ -379,8 +323,6 @@ async def remove_background(request: BGRemoveRequest):
 
             if mask is None:
                 reason = "ONNX inference failed: " + " | ".join(onnx_errors)
-                # Demo stability: disable ONNX for the current process after any runtime failure.
-                # Repeated retries are expensive on low-memory CPU boxes.
                 onnx_runtime_disabled = True
                 if any(
                     ("bad allocation" in err.lower())
@@ -392,10 +334,16 @@ async def remove_background(request: BGRemoveRequest):
                 else:
                     reason += " | ONNX disabled for this process due to runtime failure"
                 print("BG fallback to original:", reason)
-                return _best_effort_png_response(image_data, reason)
+                return _original_png_response(image_data, reason)
 
-        mask = (mask > 0.5).astype("uint8") * 255
-        mask_pil = Image.fromarray(mask).resize((w, h), Image.LANCZOS)
+        # Let the AI mask do its job natively.
+        # Removed the grabcut interference which breaks on black clothing.
+        mask = np.clip(mask, 0.0, 1.0)
+        mask_u8 = (mask * 255.0).astype("uint8")
+        
+        # Smooth the mask slightly for cleaner edges
+        mask_pil = Image.fromarray(mask_u8, mode="L").resize((w, h), Image.LANCZOS)
+        mask_pil = mask_pil.filter(ImageFilter.SMOOTH)
 
         final_image = orig_image.copy()
         final_image.putalpha(mask_pil)
@@ -403,10 +351,13 @@ async def remove_background(request: BGRemoveRequest):
         buffer = io.BytesIO()
         final_image.save(buffer, format="PNG")
         result_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        print("BG model result: success")
 
         return {
             "success": True,
             "image_base64": result_base64,
+            "bg_removed": True,
+            "fallback_reason": None,
         }
 
     except HTTPException:
@@ -416,7 +367,7 @@ async def remove_background(request: BGRemoveRequest):
         try:
             base64_data = request.image_base64.split(",")[-1]
             image_data = base64.b64decode(base64_data)
-            return _best_effort_png_response(image_data, f"Unhandled BG error: {e}")
+            return _original_png_response(image_data, f"Unhandled BG error: {e}")
         except Exception:
             raise HTTPException(status_code=500, detail="Processing failed")
 

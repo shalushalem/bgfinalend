@@ -1,6 +1,7 @@
 import base64
 import io
 import uuid
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -11,6 +12,8 @@ from PIL import Image, ImageDraw
 
 from services.appwrite_proxy import AppwriteProxy
 from services.embedding_service import encode_metadata
+from services.image_embedding_service import encode_image_bytes
+from services.image_fingerprint import compute_pixel_hash_from_bytes
 from services.qdrant_service import qdrant_service
 from services.r2_storage import R2Storage, R2StorageError
 try:
@@ -111,6 +114,45 @@ class SaveSelectedRequest(BaseModel):
 class ProcessUploadRequest(BaseModel):
     user_id: str
     image_base64: str = Field(..., min_length=20)
+
+
+def _duplicate_threshold() -> float:
+    raw = str(os.getenv("WARDROBE_DUPLICATE_THRESHOLD", "0.97") or "").strip()
+    try:
+        value = float(raw)
+        if value <= 0.0:
+            return 0.97
+        if value > 1.0:
+            return 1.0
+        return value
+    except Exception:
+        return 0.97
+
+
+def _pixel_duplicate_distance() -> int:
+    raw = str(os.getenv("WARDROBE_PIXEL_DUPLICATE_DISTANCE", "6") or "").strip()
+    try:
+        value = int(raw)
+        if value < 0:
+            return 0
+        if value > 64:
+            return 64
+        return value
+    except Exception:
+        return 6
+
+
+def _image_duplicate_threshold() -> float:
+    raw = str(os.getenv("WARDROBE_IMAGE_DUPLICATE_THRESHOLD", "0.985") or "").strip()
+    try:
+        value = float(raw)
+        if value <= 0.0:
+            return 0.985
+        if value > 1.0:
+            return 1.0
+        return value
+    except Exception:
+        return 0.985
 
 
 def _load_detector():
@@ -404,6 +446,10 @@ def save_selected(request: SaveSelectedRequest):
     storage = R2Storage()
     proxy = AppwriteProxy()
     saved: List[Dict[str, Any]] = []
+    skipped_duplicates: List[Dict[str, Any]] = []
+    duplicate_threshold = _duplicate_threshold()
+    pixel_max_distance = _pixel_duplicate_distance()
+    image_duplicate_threshold = _image_duplicate_threshold()
 
     for item in request.detected_items:
         if item.item_id not in selected:
@@ -411,6 +457,67 @@ def save_selected(request: SaveSelectedRequest):
 
         raw_bytes = _decode_simple_base64(item.raw_crop_base64)
         seg_bytes = _decode_simple_base64(item.segmented_png_base64)
+        image_vector = encode_image_bytes(seg_bytes)
+        pixel_hash = compute_pixel_hash_from_bytes(seg_bytes)
+
+        if image_vector:
+            image_duplicate = qdrant_service.find_image_duplicate(
+                image_vector,
+                request.user_id,
+                threshold=image_duplicate_threshold,
+            )
+            if image_duplicate.get("is_duplicate"):
+                skipped_duplicates.append(
+                    {
+                        "item_id": item.item_id,
+                        "name": item.name,
+                        "reason": "image_vector",
+                        "duplicate_point_id": image_duplicate.get("id"),
+                        "duplicate_score": float(image_duplicate.get("score") or 0.0),
+                    }
+                )
+                continue
+
+        if pixel_hash:
+            pixel_duplicate = qdrant_service.find_pixel_duplicate(
+                request.user_id,
+                pixel_hash,
+                max_distance=pixel_max_distance,
+            )
+            if pixel_duplicate.get("is_duplicate"):
+                skipped_duplicates.append(
+                    {
+                        "item_id": item.item_id,
+                        "name": item.name,
+                        "reason": "pixel_hash",
+                        "pixel_hash": pixel_hash,
+                        "pixel_distance": pixel_duplicate.get("distance"),
+                        "duplicate_point_id": pixel_duplicate.get("id"),
+                    }
+                )
+                continue
+
+        vector_input = {
+            "category": item.category,
+            "sub_category": item.sub_category,
+            "color_code": item.color_code,
+            "pattern": item.pattern,
+            "occasions": item.occasions,
+        }
+        vector = encode_metadata(vector_input)
+        duplicate = qdrant_service.find_duplicate(vector, request.user_id, threshold=duplicate_threshold)
+        if duplicate.get("is_duplicate"):
+            skipped_duplicates.append(
+                {
+                    "item_id": item.item_id,
+                    "name": item.name,
+                    "reason": "semantic",
+                    "duplicate_point_id": duplicate.get("id"),
+                    "duplicate_score": float(duplicate.get("score") or 0.0),
+                }
+            )
+            continue
+
         file_id = str(uuid.uuid4())
 
         try:
@@ -435,9 +542,9 @@ def save_selected(request: SaveSelectedRequest):
             "masked_url": upload["masked_image_url"],
             "image_id": upload["raw_file_name"],
             "masked_id": upload["masked_file_name"],
+            "qdrant_point_id": file_id,
             "worn": 0,
             "liked": False,
-            "notes": item.reasoning,
         }
 
         try:
@@ -445,15 +552,6 @@ def save_selected(request: SaveSelectedRequest):
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Appwrite save failed: {exc}")
 
-        vector = encode_metadata(
-            {
-                "category": item.category,
-                "sub_category": item.sub_category,
-                "color_code": item.color_code,
-                "pattern": item.pattern,
-                "occasions": item.occasions,
-            }
-        )
         qdrant_service.upsert_item(
             item_id=file_id,
             vector=vector,
@@ -463,8 +561,22 @@ def save_selected(request: SaveSelectedRequest):
                 "sub_category": item.sub_category,
                 "color_code": item.color_code,
                 "image_url": upload["masked_image_url"],
+                "pixel_hash": pixel_hash,
             },
         )
+        if image_vector:
+            qdrant_service.upsert_image_vector(
+                point_id=file_id,
+                vector=image_vector,
+                payload={
+                    "userId": request.user_id,
+                    "category": item.category,
+                    "sub_category": item.sub_category,
+                    "color_code": item.color_code,
+                    "image_url": upload["masked_image_url"],
+                    "pixel_hash": pixel_hash,
+                },
+            )
 
         saved.append(
             {
@@ -482,6 +594,13 @@ def save_selected(request: SaveSelectedRequest):
         "success": True,
         "message": f"Saved {len(saved)} selected items to wardrobe.",
         "saved_items": saved,
+        "skipped_duplicates": skipped_duplicates,
+        "meta": {
+            "duplicate_threshold": duplicate_threshold,
+            "image_duplicate_threshold": image_duplicate_threshold,
+            "pixel_max_distance": pixel_max_distance,
+            "duplicates_skipped": len(skipped_duplicates),
+        },
     }
 
 

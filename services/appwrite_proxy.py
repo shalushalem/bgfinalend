@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -92,19 +93,27 @@ class AppwriteProxy:
         }
 
         self.order_query_map = {
-            "outfits": 'orderDesc("$createdAt")',
-            "plans": "",
-            "saved_boards": 'orderDesc("$createdAt")',
-            "skincare": "",
-            "workout_outfits": 'orderDesc("$createdAt")',
-            "bills": 'orderDesc("$createdAt")',
-            "coupons": 'orderDesc("$createdAt")',
-            "meds": 'orderDesc("$createdAt")',
-            "med_logs": 'orderDesc("time")',
-            "meal_plans": 'orderDesc("$createdAt")',
-            "life_goals": 'orderDesc("$createdAt")',
-            "life_boards": 'orderDesc("$createdAt")',
+            "outfits": {"method": "orderDesc", "attribute": "$createdAt"},
+            "plans": None,
+            "saved_boards": {"method": "orderDesc", "attribute": "$createdAt"},
+            "skincare": None,
+            "workout_outfits": {"method": "orderDesc", "attribute": "$createdAt"},
+            "bills": {"method": "orderDesc", "attribute": "$createdAt"},
+            "coupons": {"method": "orderDesc", "attribute": "$createdAt"},
+            "meds": {"method": "orderDesc", "attribute": "$createdAt"},
+            "med_logs": {"method": "orderDesc", "attribute": "time"},
+            "meal_plans": {"method": "orderDesc", "attribute": "$createdAt"},
+            "life_goals": {"method": "orderDesc", "attribute": "$createdAt"},
+            "life_boards": {"method": "orderDesc", "attribute": "$createdAt"},
         }
+
+    @staticmethod
+    def _serialize_query_token(token: Any) -> str:
+        # Appwrite 1.9 expects query objects in the REST API.
+        # Keep string support for backward compatibility with older deployments.
+        if isinstance(token, dict):
+            return json.dumps(token, separators=(",", ":"), ensure_ascii=False)
+        return str(token)
 
     def _ensure_config(self) -> None:
         missing = []
@@ -182,10 +191,148 @@ class AppwriteProxy:
         except Exception as exc:
             raise AppwriteProxyError("Appwrite returned invalid JSON response.") from exc
 
+    def _list_documents_page(
+        self,
+        collection_id: str,
+        *,
+        page_limit: int,
+        offset: int,
+        queries: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        query_tokens = list(queries or [])
+        query_tokens.extend(
+            [
+                {"method": "limit", "values": [int(page_limit)]},
+                {"method": "offset", "values": [int(offset)]},
+            ]
+        )
+
+        serialized_tokens = [self._serialize_query_token(token) for token in query_tokens]
+
+        indexed_queries: Dict[str, Any] = {}
+        for idx, token in enumerate(serialized_tokens):
+            indexed_queries[f"queries[{idx}]"] = token
+
+        # Prefer query operator syntax (supports filters/order). Fallback to plain params.
+        param_candidates: List[Dict[str, Any]] = [
+            {"queries[]": serialized_tokens},
+            {"queries": serialized_tokens},
+            indexed_queries,
+            {"limit": int(page_limit), "offset": int(offset)},
+        ]
+
+        for params in param_candidates:
+            try:
+                data = self._request(
+                    "GET",
+                    self._url(collection_id),
+                    params=params,
+                )
+                docs = data.get("documents", [])
+                if isinstance(docs, list):
+                    return {
+                        "documents": docs,
+                        "total": data.get("total"),
+                        "used_query_syntax": ("queries[]" in params or "queries" in params),
+                    }
+            except AppwriteProxyError:
+                continue
+            except Exception:
+                continue
+
+        if int(offset) == 0:
+            data = self._request(
+                "GET",
+                self._url(collection_id),
+            )
+            docs = data.get("documents", [])
+            if isinstance(docs, list):
+                return {
+                    "documents": docs,
+                    "total": data.get("total"),
+                    "used_query_syntax": False,
+                }
+        return {"documents": [], "total": None, "used_query_syntax": False}
+
+    def _list_documents_local_filtered(
+        self,
+        collection_id: str,
+        *,
+        user_field: Optional[str],
+        user_id: Optional[str],
+        occasion: Optional[str],
+        order_query: Optional[Dict[str, Any]],
+        limit: int,
+        offset: int,
+    ) -> Dict[str, Any]:
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+        target_count = safe_offset + safe_limit + 1
+
+        page_limit = min(100, max(25, safe_limit))
+        raw_offset = 0
+        max_scan = max(target_count * 5, 500)
+
+        filtered_docs: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        while len(filtered_docs) < target_count and raw_offset < max_scan:
+            page = self._list_documents_page(
+                collection_id,
+                page_limit=page_limit,
+                offset=raw_offset,
+                queries=[order_query] if order_query else [],
+            )
+            docs = page.get("documents", [])
+            if not docs:
+                break
+
+            for d in docs:
+                doc_id = str(d.get("$id", ""))
+                if doc_id and doc_id in seen_ids:
+                    continue
+                if not self._matches_user(d, user_field, user_id):
+                    continue
+                if occasion and str(d.get("occasion", "")) != str(occasion):
+                    continue
+                if doc_id:
+                    seen_ids.add(doc_id)
+                filtered_docs.append(d)
+                if len(filtered_docs) >= target_count:
+                    break
+
+            if len(docs) < page_limit:
+                break
+            raw_offset += page_limit
+
+        page_docs = filtered_docs[safe_offset : safe_offset + safe_limit]
+        has_more = len(filtered_docs) > (safe_offset + len(page_docs))
+        return {
+            "documents": page_docs,
+            "total": None,
+            "has_more": has_more,
+            "next_offset": safe_offset + len(page_docs) if has_more else None,
+        }
+
     @staticmethod
-    def _equal_query(field: str, value: str) -> str:
-        safe_value = value.replace('"', '\\"')
-        return f'equal("{field}", "{safe_value}")'
+    def _equal_query(field: str, value: str) -> Dict[str, Any]:
+        return {"method": "equal", "attribute": str(field), "values": [str(value)]}
+
+    @staticmethod
+    def _matches_user(doc: Dict[str, Any], user_field: Optional[str], user_id: Optional[str]) -> bool:
+        if user_id is None or str(user_id) == "":
+            return True
+        expected = str(user_id)
+        candidate_keys: List[str] = []
+        if user_field:
+            candidate_keys.append(user_field)
+        for alias in ("userId", "userid", "user_id"):
+            if alias not in candidate_keys:
+                candidate_keys.append(alias)
+        for key in candidate_keys:
+            if str(doc.get(key, "")) == expected:
+                return True
+        return False
 
     def list_documents(
         self,
@@ -194,28 +341,92 @@ class AppwriteProxy:
         user_id: Optional[str] = None,
         occasion: Optional[str] = None,
         limit: int = 100,
-    ) -> List[Dict[str, Any]]:
+        offset: int = 0,
+        return_meta: bool = False,
+    ):
         collection_id = self._collection_id(resource)
         user_field = self.user_field_map.get(resource)
-        safe_limit = max(1, min(int(limit), 100))
-        data = self._request(
-            "GET",
-            self._url(collection_id),
-        )
-        docs = data.get("documents", [])
+        try:
+            page_max = int(os.getenv("APPWRITE_PAGE_MAX", "100"))
+        except Exception:
+            page_max = 100
+        safe_limit = max(1, min(int(limit), max(1, page_max)))
+        safe_offset = max(0, int(offset))
+        order_query = self.order_query_map.get(resource)
 
-        # Apply filters in backend to avoid REST query syntax incompatibilities.
+        query_tokens: List[Any] = []
+        if order_query:
+            query_tokens.append(order_query)
         if user_field and user_id:
-            docs = [d for d in docs if str(d.get(user_field, "")) == str(user_id)]
+            query_tokens.append(self._equal_query(user_field, str(user_id)))
         if occasion:
-            docs = [d for d in docs if str(d.get("occasion", "")) == str(occasion)]
+            query_tokens.append(self._equal_query("occasion", str(occasion)))
 
-        if resource == "med_logs":
-            docs.sort(key=lambda d: d.get("time", ""), reverse=True)
-        else:
-            docs.sort(key=lambda d: d.get("$createdAt", ""), reverse=True)
+        page = self._list_documents_page(
+            collection_id,
+            page_limit=safe_limit,
+            offset=safe_offset,
+            queries=query_tokens,
+        )
+        docs = page.get("documents", [])
+        total = page.get("total")
+        used_query_syntax = bool(page.get("used_query_syntax"))
 
-        return docs[:safe_limit]
+        filters_requested = bool((user_field and user_id) or occasion)
+        low_result_with_filter = filters_requested and safe_offset == 0 and len(docs) <= 1
+        fallback_needed = ((not used_query_syntax) and (filters_requested or bool(order_query))) or low_result_with_filter
+
+        if fallback_needed:
+            fallback = self._list_documents_local_filtered(
+                collection_id,
+                user_field=user_field,
+                user_id=user_id,
+                occasion=occasion,
+                order_query=order_query,
+                limit=safe_limit,
+                offset=safe_offset,
+            )
+            docs = fallback.get("documents", [])
+            has_more = bool(fallback.get("has_more"))
+            next_offset = fallback.get("next_offset")
+            payload = {
+                "documents": docs,
+                "meta": {
+                    "limit": safe_limit,
+                    "offset": safe_offset,
+                    "has_more": has_more,
+                    "next_offset": next_offset,
+                    "total": None,
+                    "mode": "local_fallback",
+                },
+            }
+            return payload if return_meta else docs
+
+        has_more = False
+        next_offset = None
+        try:
+            if total is not None:
+                has_more = (safe_offset + len(docs)) < int(total)
+            else:
+                has_more = len(docs) >= safe_limit
+        except Exception:
+            has_more = len(docs) >= safe_limit
+
+        if has_more:
+            next_offset = safe_offset + len(docs)
+
+        payload = {
+            "documents": docs,
+            "meta": {
+                "limit": safe_limit,
+                "offset": safe_offset,
+                "has_more": has_more,
+                "next_offset": next_offset,
+                "total": total,
+                "mode": "query" if used_query_syntax else "plain_params",
+            },
+        }
+        return payload if return_meta else docs
 
     def get_document(self, resource: str, document_id: str) -> Dict[str, Any]:
         collection_id = self._collection_id(resource)

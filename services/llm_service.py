@@ -12,12 +12,12 @@ from brain.tone.tone_engine import tone_engine
 load_dotenv()
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 MODEL_FALLBACKS = [
     m.strip()
     for m in os.getenv(
         "OLLAMA_MODEL_FALLBACKS",
-        "mistral:7b,qwen2.5:3b,llama3:latest,qwen2.5vl:latest",
+        "llama3.1:latest,llama3.1",
     ).split(",")
     if m.strip()
 ]
@@ -47,11 +47,13 @@ def _model_candidates(requested_model: str | None) -> list[str]:
     else:
         first_model = DEFAULT_MODEL
 
-    for model in [first_model, *MODEL_FALLBACKS]:
+    for index, model in enumerate([first_model, *MODEL_FALLBACKS]):
         m = str(model or "").strip()
         if not m:
             continue
-        if not ALLOW_HEAVY_MODELS and _is_heavy_model(m):
+        # Always honor the configured first model (DEFAULT_MODEL/requested),
+        # then filter heavy fallback models when disabled.
+        if index > 0 and not ALLOW_HEAVY_MODELS and _is_heavy_model(m):
             continue
         if m not in ordered:
             ordered.append(m)

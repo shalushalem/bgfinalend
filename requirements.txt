@@ -15,3 +15,7 @@ scikit-learn
 Pillow
 sentence-transformers
 transformers
+torchvision
+kornia
+timm
+huggingface-hub

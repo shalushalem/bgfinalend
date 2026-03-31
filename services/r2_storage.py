@@ -165,3 +165,65 @@ class R2Storage:
             "image_url": f"{target_public_url}/{file_name}",
             "content_type": content_type,
         }
+
+    def read_object_bytes(
+        self,
+        *,
+        bucket: str,
+        object_name: str,
+        max_bytes: int = 15 * 1024 * 1024,
+    ) -> bytes:
+        safe_bucket = str(bucket or "").strip()
+        safe_name = str(object_name or "").strip().strip("/")
+        if not safe_bucket or not safe_name:
+            return b""
+
+        client = self._client()
+        response = None
+        try:
+            response = client.get_object(safe_bucket, safe_name)
+            data = response.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise R2StorageError(
+                    f"Object too large to read safely: {safe_name} ({len(data)} bytes)"
+                )
+            return data
+        except Exception:
+            return b""
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                try:
+                    response.release_conn()
+                except Exception:
+                    pass
+
+    def delete_wardrobe_images(
+        self,
+        *,
+        raw_file_name: str = "",
+        masked_file_name: str = "",
+    ) -> Dict[str, bool]:
+        client = self._client()
+        result = {"raw_deleted": False, "masked_deleted": False}
+
+        if raw_file_name and self.raw_bucket:
+            try:
+                client.remove_object(self.raw_bucket, raw_file_name)
+                result["raw_deleted"] = True
+            except Exception:
+                # Keep delete idempotent even if object is already missing.
+                pass
+
+        if masked_file_name and self.wardrobe_bucket:
+            try:
+                client.remove_object(self.wardrobe_bucket, masked_file_name)
+                result["masked_deleted"] = True
+            except Exception:
+                # Keep delete idempotent even if object is already missing.
+                pass
+
+        return result
