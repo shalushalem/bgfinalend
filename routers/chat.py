@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any
 import re
@@ -18,6 +18,7 @@ try:
     from services.job_tracker import job_tracker
 except Exception:
     job_tracker = None
+from services.task_queue import enqueue_task
 
 # 🔥 NEW
 from services.weather_service import get_hourly_weather
@@ -158,7 +159,7 @@ class DailyCardsRequest(BaseModel):
 # CHAT ENDPOINT
 # -------------------------
 @router.post("/text")
-def text_chat(request: TextChatRequest):
+def text_chat(request: TextChatRequest, http_request: Request):
 
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages provided")
@@ -238,6 +239,7 @@ def text_chat(request: TextChatRequest):
                 "module_context": request.module_context,
                 "history": merged_history[-20:],
                 "slots": slot_hints,
+                "request_id": str(getattr(http_request.state, "request_id", "") or ""),
 
                 # 🔥 NEW CONTEXT
                 "weather": weather_data.get("condition"),
@@ -266,16 +268,17 @@ def text_chat(request: TextChatRequest):
             run_heavy_audio_task is not None
             and os.getenv("ENABLE_AUDIO_TASKS", "false").lower() in ("1", "true", "yes")
         ):
-            task = run_heavy_audio_task.delay(message, target_lang)
-            audio_job_id = task.id
-            if job_tracker is not None:
-                job_tracker.create(
-                    job_id=audio_job_id,
-                    kind="audio_generate",
-                    user_id=request.user_id or request.userID or "user_1",
-                    source="api:/api/text",
-                    meta={"task_type": "generate_audio"},
-                )
+            request_id = str(getattr(http_request.state, "request_id", "") or "")
+            audio_job_id = enqueue_task(
+                task_func=run_heavy_audio_task,
+                args=[message, target_lang],
+                kwargs={"request_id": request_id},
+                kind="audio_generate",
+                user_id=request.user_id or request.userID or "user_1",
+                request_id=request_id,
+                source="api:/api/text",
+                meta={"task_type": "generate_audio"},
+            )
         else:
             audio_job_id = "offline"
     except Exception:
@@ -443,3 +446,4 @@ def daily_cards(request: DailyCardsRequest):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to build daily cards: {exc}")
+

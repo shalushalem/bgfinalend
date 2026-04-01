@@ -41,7 +41,7 @@ class AhviOrchestrator:
     def run(self, text: str, user_id: str = None, context: Dict[str, Any] = None) -> Dict[str, Any]:
         context = context or {}
         user_id = user_id or "anonymous"
-        request_id = str(uuid.uuid4())
+        request_id = str(context.get("request_id") or uuid.uuid4())
         started_at = perf_counter()
 
         appwrite = AppwriteProxy()
@@ -464,8 +464,22 @@ class AhviOrchestrator:
             }
         )
         cards = pipeline.get("cards", []) if isinstance(pipeline, dict) else []
-        top_card = cards[0] if cards else {}
-        tryon_payload = top_card.get("tryon_payload") if isinstance(top_card, dict) else None
+        top_card = {}
+        tryon_payload = None
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            payload = card.get("tryon_payload")
+            items = (payload or {}).get("items", {}) if isinstance(payload, dict) else {}
+            if (
+                isinstance(items, dict)
+                and str(items.get("top_id") or "").strip()
+                and str(items.get("bottom_id") or "").strip()
+                and str(items.get("shoes_id") or "").strip()
+            ):
+                top_card = card
+                tryon_payload = payload
+                break
 
         if not tryon_payload:
             return {

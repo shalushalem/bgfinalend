@@ -145,7 +145,11 @@ def detect_intent(user_text: str, history=None) -> Dict[str, Any]:
         return fallback
 
     prompt = INTENT_PROMPT + user_text
-    response = generate_text(prompt, options={"temperature": 0.2, "num_predict": 200})
+        response = generate_text(
+            prompt,
+            options={"temperature": 0.2, "num_predict": 200},
+            usecase="intent",
+        )
 
     parsed = _safe_parse(response)
 

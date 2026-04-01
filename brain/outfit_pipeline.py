@@ -528,15 +528,28 @@ def _generate_story(outfit: Dict[str, Any], context: Dict[str, Any]) -> Dict[str
 
 
 def _build_tryon_payload(outfit: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    def _safe_id(value: Any) -> str | None:
+        text = str(value or "").strip()
+        return text or None
+
+    top_id = _safe_id((outfit.get("top") or {}).get("id"))
+    bottom_id = _safe_id((outfit.get("bottom") or {}).get("id"))
+    shoes_id = _safe_id((outfit.get("shoes") or {}).get("id"))
+    outerwear_id = _safe_id((outfit.get("outerwear") or {}).get("id"))
+
+    # Try-on requires a complete base silhouette.
+    if not (top_id and bottom_id and shoes_id):
+        return {}
+
     return {
         "mode": "virtual_try_on",
         "occasion": context.get("occasion"),
         "weather": context.get("weather"),
         "items": {
-            "top_id": (outfit.get("top") or {}).get("id"),
-            "bottom_id": (outfit.get("bottom") or {}).get("id"),
-            "shoes_id": (outfit.get("shoes") or {}).get("id"),
-            "outerwear_id": (outfit.get("outerwear") or {}).get("id"),
+            "top_id": top_id,
+            "bottom_id": bottom_id,
+            "shoes_id": shoes_id,
+            "outerwear_id": outerwear_id,
         },
         "prompt": f"Try on this look for {context.get('occasion', 'daily wear')}.",
     }

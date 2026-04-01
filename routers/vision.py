@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from collections import Counter
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from sklearn.cluster import KMeans
 
@@ -31,6 +31,7 @@ try:
     from services.job_tracker import job_tracker
 except Exception:
     job_tracker = None
+from services.task_queue import enqueue_task
 try:
     from routers.bg_remover import BGRemoveRequest, remove_background_sync
 except Exception:
@@ -519,24 +520,27 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
 
 
 @router.post("/analyze-image/async", status_code=status.HTTP_202_ACCEPTED)
-def analyze_image_async(request: ImageAnalyzeRequest):
+def analyze_image_async(http_request: Request, request: ImageAnalyzeRequest):
     if vision_analyze_task is None:
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
-        task = vision_analyze_task.delay(request.image_base64, request.userId)
-        if job_tracker is not None:
-            job_tracker.create(
-                job_id=task.id,
-                kind="vision_analyze",
-                user_id=request.userId,
-                source="api:/api/vision/analyze-image/async",
-                meta={"task_type": "vision_analyze_task"},
-            )
+        request_id = str(getattr(http_request.state, "request_id", "") or "")
+        task_id = enqueue_task(
+            task_func=vision_analyze_task,
+            args=[request.image_base64, request.userId],
+            kwargs={"request_id": request_id},
+            kind="vision_analyze",
+            user_id=request.userId,
+            request_id=request_id,
+            source="api:/api/vision/analyze-image/async",
+            meta={"task_type": "vision_analyze_task"},
+        )
         return {
             "success": True,
             "status": "queued",
-            "task_id": task.id,
+            "task_id": task_id,
             "task_type": "vision_analyze_task",
+            "request_id": request_id,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue vision analysis: {exc}")

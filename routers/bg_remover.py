@@ -1,4 +1,4 @@
-﻿import os
+import os
 import io
 import base64
 import torch
@@ -7,7 +7,7 @@ import numpy as np
 import cv2
 from collections import deque
 from PIL import Image, ImageFilter
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, validator
 from transformers import AutoModelForImageSegmentation
 from fastapi import status
@@ -26,6 +26,7 @@ try:
     from services.job_tracker import job_tracker
 except Exception:
     job_tracker = None
+from services.task_queue import enqueue_task
 
 try:
     import onnxruntime as ort
@@ -381,23 +382,25 @@ def remove_background(request: BGRemoveRequest):
 
 
 @router.post("/remove-bg/async", status_code=status.HTTP_202_ACCEPTED)
-async def remove_background_async(request: BGRemoveRequest):
+async def remove_background_async(http_request: Request, request: BGRemoveRequest):
     if bg_remove_task is None:
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
-        task = bg_remove_task.delay(request.image_base64)
-        if job_tracker is not None:
-            job_tracker.create(
-                job_id=task.id,
-                kind="bg_remove",
-                source="api:/api/background/remove-bg/async",
-                meta={"task_type": "bg_remove_task"},
-            )
+        task_id = enqueue_task(
+            task_func=bg_remove_task,
+            args=[request.image_base64],
+            kind="bg_remove",
+            user_id=None,
+            request_id=str(getattr(http_request.state, "request_id", "") or ""),
+            source="api:/api/background/remove-bg/async",
+            meta={"task_type": "bg_remove_task"},
+        )
         return {
             "success": True,
             "status": "queued",
-            "task_id": task.id,
+            "task_id": task_id,
             "task_type": "bg_remove_task",
+            "request_id": str(getattr(http_request.state, "request_id", "") or ""),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue bg removal: {exc}")

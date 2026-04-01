@@ -137,7 +137,14 @@ def safe_request(endpoint: str, payload: dict, timeout: int = 30):
 # =========================
 # TONE-AWARE TEXT GENERATION
 # =========================
-def generate_text(prompt: str, options: dict = None, user_profile=None, signals=None) -> str:
+def generate_text(
+    prompt: str,
+    options: dict = None,
+    user_profile=None,
+    signals=None,
+    model: str | None = None,
+    timeout_seconds: int | None = None,
+) -> str:
     if not prompt:
         return "none"
 
@@ -161,7 +168,7 @@ Guidelines:
 """
 
     payload = {
-        "model": DEFAULT_MODEL,
+        "model": model or DEFAULT_MODEL,
         "prompt": full_prompt,
         "stream": False,
     }
@@ -169,7 +176,7 @@ Guidelines:
     if options:
         payload["options"] = options
 
-    data = safe_request("generate", payload, timeout=30)
+    data = safe_request("generate", payload, timeout=int(timeout_seconds or 30))
 
     if not data:
         return "none"
@@ -182,8 +189,14 @@ Guidelines:
 # =========================
 # CHAT COMPLETION
 # =========================
-def chat_completion(messages: list, system_instruction: str = "", model: str = DEFAULT_MODEL,
-                    user_profile=None, signals=None) -> str:
+def chat_completion(
+    messages: list,
+    system_instruction: str = "",
+    model: str = DEFAULT_MODEL,
+    user_profile=None,
+    signals=None,
+    timeout_seconds: int | None = None,
+) -> str:
 
     if not messages:
         return "I didn't catch that!"
@@ -229,7 +242,7 @@ Rules:
         "stream": False,
     }
 
-    data = safe_request("chat", payload, timeout=45)
+    data = safe_request("chat", payload, timeout=int(timeout_seconds or 45))
 
     if not data:
         return "I'm having trouble thinking right now. Try again in a moment."

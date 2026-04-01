@@ -17,6 +17,7 @@ from services.security_limits import check_rate_limit, extract_client_ip
 from services.settings import settings
 from middleware.auth_middleware import get_current_user
 from services.job_tracker import job_tracker
+from services.request_context import set_request_id, new_request_id
 
 
 # -------------------------
@@ -236,10 +237,12 @@ async def shutdown_event():
 # -------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = str(getattr(request.state, "request_id", "") or "")
     return JSONResponse(
         status_code=400,
         content={
             "success": False,
+            "request_id": request_id,
             "error": {
                 "code": "VALIDATION_ERROR",
                 "message": "Invalid request",
@@ -251,11 +254,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    request_id = str(getattr(request.state, "request_id", "") or "")
     logger.exception("Unhandled error on %s", request.url.path, exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
+            "request_id": request_id,
             "error": {
                 "code": "INTERNAL_ERROR",
                 "message": "Internal server error",
@@ -279,6 +284,16 @@ app.add_middleware(StreamBodyLimitMiddleware, max_bytes=settings.upload_max_byte
 
 
 @app.middleware("http")
+async def request_tracing_middleware(request: Request, call_next):
+    incoming = request.headers.get("X-Request-ID")
+    request_id = set_request_id(incoming if incoming else new_request_id())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.middleware("http")
 async def auth_guard_middleware(request: Request, call_next):
     if not settings.auth_required:
         return await call_next(request)
@@ -298,9 +313,16 @@ async def auth_guard_middleware(request: Request, call_next):
 async def rate_limit_middleware(request: Request, call_next):
     if not settings.rate_limit_enabled:
         return await call_next(request)
+    if str(request.method or "").upper() == "OPTIONS":
+        return await call_next(request)
+    request_id = str(getattr(request.state, "request_id", "") or "")
     ip = extract_client_ip(request.headers, request.client.host if request.client else None)
+    user_id = ""
+    if isinstance(getattr(request.state, "user", None), dict):
+        user_id = str(request.state.user.get("$id") or request.state.user.get("id") or "")
+    identity = user_id or ip
     allowed, remaining = await check_rate_limit(
-        bucket_key=f"{ip}:{request.url.path}",
+        bucket_key=f"{identity}:{request.url.path}",
         max_requests=settings.rate_limit_max_requests,
         window_seconds=settings.rate_limit_window_seconds,
     )
@@ -309,15 +331,23 @@ async def rate_limit_middleware(request: Request, call_next):
             status_code=429,
             content={
                 "success": False,
+                "request_id": request_id,
                 "error": {
                     "code": "RATE_LIMITED",
                     "message": "Too many requests. Please retry later.",
                 },
             },
-            headers={"X-RateLimit-Remaining": str(remaining)},
+            headers={
+                "X-RateLimit-Remaining": str(remaining),
+                "X-RateLimit-Limit": str(settings.rate_limit_max_requests),
+                "X-RateLimit-Window": str(settings.rate_limit_window_seconds),
+                "Retry-After": str(settings.rate_limit_window_seconds),
+            },
         )
     response = await call_next(request)
     response.headers["X-RateLimit-Remaining"] = str(remaining)
+    response.headers["X-RateLimit-Limit"] = str(settings.rate_limit_max_requests)
+    response.headers["X-RateLimit-Window"] = str(settings.rate_limit_window_seconds)
     return response
 
 
@@ -420,12 +450,13 @@ def health_check():
 # CELERY STATUS
 # -------------------------
 @app.get("/api/tasks/{job_id}")
-def get_task_status(job_id: str):
+def get_task_status(job_id: str, request: Request):
+    request_id = str(getattr(request.state, "request_id", "") or "")
     tracker_data = job_tracker.get(job_id) or {}
     if not celery_app or AsyncResult is None:
         if tracker_data:
-            return {"status": tracker_data.get("status", "queued"), "state": tracker_data.get("state", "PENDING"), "job": tracker_data}
-        return {"status": "celery not configured"}
+            return {"status": tracker_data.get("status", "queued"), "state": tracker_data.get("state", "PENDING"), "job": tracker_data, "request_id": request_id}
+        return {"status": "celery not configured", "request_id": request_id}
 
     task_result = AsyncResult(job_id, app=celery_app)
 
@@ -434,6 +465,7 @@ def get_task_status(job_id: str):
             "status": str(tracker_data.get("status") or "queued"),
             "state": "PENDING",
             "job": tracker_data,
+            "request_id": request_id,
         }
 
     if task_result.state == "STARTED":
@@ -442,6 +474,7 @@ def get_task_status(job_id: str):
             "state": "STARTED",
             "meta": task_result.info if isinstance(task_result.info, dict) else {},
             "job": tracker_data,
+            "request_id": request_id,
         }
 
     if task_result.state == "SUCCESS":
@@ -450,6 +483,7 @@ def get_task_status(job_id: str):
             "state": "SUCCESS",
             "result": task_result.result,
             "job": tracker_data,
+            "request_id": request_id,
         }
 
     if task_result.state == "FAILURE":
@@ -458,6 +492,7 @@ def get_task_status(job_id: str):
             "state": "FAILURE",
             "error": str(task_result.info),
             "job": tracker_data,
+            "request_id": request_id,
         }
 
     if task_result.state == "RETRY":
@@ -466,18 +501,20 @@ def get_task_status(job_id: str):
             "state": "RETRY",
             "error": str(task_result.info),
             "job": tracker_data,
+            "request_id": request_id,
         }
 
     return {
         "status": str(tracker_data.get("status") or "processing"),
         "state": task_result.state,
         "job": tracker_data,
+        "request_id": request_id,
     }
 
 
 @app.get("/api/jobs/recent")
-def list_recent_jobs(limit: int = 25, user_id: str | None = None):
+def list_recent_jobs(limit: int = 25, user_id: str | None = None, request_id: str | None = None):
     return {
         "success": True,
-        "jobs": job_tracker.list_recent(limit=limit, user_id=user_id),
+        "jobs": job_tracker.list_recent(limit=limit, user_id=user_id, request_id=request_id),
     }

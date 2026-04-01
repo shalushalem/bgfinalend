@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 
@@ -21,6 +21,7 @@ try:
     from services.job_tracker import job_tracker
 except Exception:
     job_tracker = None
+from services.task_queue import enqueue_task
 
 try:
     from transformers import pipeline
@@ -415,24 +416,27 @@ def analyze_capture_core(user_id: str, image_base64: str):
 
 
 @router.post("/analyze/async", status_code=status.HTTP_202_ACCEPTED)
-def analyze_capture_async(request: CaptureAnalyzeRequest):
+def analyze_capture_async(http_request: Request, request: CaptureAnalyzeRequest):
     if capture_analyze_task is None:
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
-        task = capture_analyze_task.delay(request.user_id, request.image_base64)
-        if job_tracker is not None:
-            job_tracker.create(
-                job_id=task.id,
-                kind="capture_analyze",
-                user_id=request.user_id,
-                source="api:/api/wardrobe/capture/analyze/async",
-                meta={"task_type": "capture_analyze_task"},
-            )
+        request_id = str(getattr(http_request.state, "request_id", "") or "")
+        task_id = enqueue_task(
+            task_func=capture_analyze_task,
+            args=[request.user_id, request.image_base64],
+            kwargs={"request_id": request_id},
+            kind="capture_analyze",
+            user_id=request.user_id,
+            request_id=request_id,
+            source="api:/api/wardrobe/capture/analyze/async",
+            meta={"task_type": "capture_analyze_task"},
+        )
         return {
             "success": True,
             "status": "queued",
-            "task_id": task.id,
+            "task_id": task_id,
             "task_type": "capture_analyze_task",
+            "request_id": request_id,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue capture analyze: {exc}")
@@ -491,7 +495,7 @@ def save_selected_core(
 
 
 @router.post("/save-selected/async", status_code=status.HTTP_202_ACCEPTED)
-def save_selected_async(request: SaveSelectedRequest):
+def save_selected_async(http_request: Request, request: SaveSelectedRequest):
     if capture_save_selected_task is None:
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
@@ -506,44 +510,50 @@ def save_selected_async(request: SaveSelectedRequest):
             "selected_item_ids": request.selected_item_ids,
             "detected_items": detected,
         }
-        task = capture_save_selected_task.delay(payload)
-        if job_tracker is not None:
-            job_tracker.create(
-                job_id=task.id,
-                kind="capture_save_selected",
-                user_id=request.user_id,
-                source="api:/api/wardrobe/capture/save-selected/async",
-                meta={"task_type": "capture_save_selected_task"},
-            )
+        request_id = str(getattr(http_request.state, "request_id", "") or "")
+        task_id = enqueue_task(
+            task_func=capture_save_selected_task,
+            args=[payload],
+            kwargs={"request_id": request_id},
+            kind="capture_save_selected",
+            user_id=request.user_id,
+            request_id=request_id,
+            source="api:/api/wardrobe/capture/save-selected/async",
+            meta={"task_type": "capture_save_selected_task"},
+        )
         return {
             "success": True,
             "status": "queued",
-            "task_id": task.id,
+            "task_id": task_id,
             "task_type": "capture_save_selected_task",
+            "request_id": request_id,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue save-selected: {exc}")
 
 
 @router.post("/process-upload/async", status_code=status.HTTP_202_ACCEPTED)
-def process_upload_async(request: ProcessUploadRequest):
+def process_upload_async(http_request: Request, request: ProcessUploadRequest):
     if process_upload_task is None:
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
-        task = process_upload_task.delay(request.user_id, request.image_base64)
-        if job_tracker is not None:
-            job_tracker.create(
-                job_id=task.id,
-                kind="process_upload",
-                user_id=request.user_id,
-                source="api:/api/wardrobe/capture/process-upload/async",
-                meta={"task_type": "process_upload"},
-            )
+        request_id = str(getattr(http_request.state, "request_id", "") or "")
+        task_id = enqueue_task(
+            task_func=process_upload_task,
+            args=[request.user_id, request.image_base64],
+            kwargs={"request_id": request_id},
+            kind="process_upload",
+            user_id=request.user_id,
+            request_id=request_id,
+            source="api:/api/wardrobe/capture/process-upload/async",
+            meta={"task_type": "process_upload"},
+        )
         return {
             "success": True,
             "status": "queued",
-            "task_id": task.id,
+            "task_id": task_id,
             "task_type": "process_upload",
+            "request_id": request_id,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue process-upload: {exc}")

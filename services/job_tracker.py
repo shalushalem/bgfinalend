@@ -99,6 +99,7 @@ class JobTracker:
         job_id: str,
         kind: str,
         user_id: str | None = None,
+        request_id: str | None = None,
         source: str | None = None,
         meta: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
@@ -106,6 +107,7 @@ class JobTracker:
             "job_id": str(job_id),
             "kind": str(kind or "job"),
             "user_id": str(user_id or ""),
+            "request_id": str(request_id or ""),
             "source": str(source or ""),
             "status": "queued",
             "state": "PENDING",
@@ -169,9 +171,16 @@ class JobTracker:
         )
         self._write(current)
 
-    def list_recent(self, *, limit: int = 50, user_id: str | None = None) -> List[Dict[str, Any]]:
+    def list_recent(
+        self,
+        *,
+        limit: int = 50,
+        user_id: str | None = None,
+        request_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 200))
         uid = str(user_id or "").strip()
+        rid = str(request_id or "").strip()
 
         client = self._redis_client()
         if client is not None:
@@ -183,6 +192,8 @@ class JobTracker:
                     row = self.get(str(jid))
                     if isinstance(row, dict):
                         rows.append(row)
+                if rid:
+                    rows = [row for row in rows if str(row.get("request_id") or "") == rid]
                 return rows
             except Exception:
                 pass
@@ -192,6 +203,8 @@ class JobTracker:
         items.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
         if uid:
             items = [row for row in items if str(row.get("user_id") or "") == uid]
+        if rid:
+            items = [row for row in items if str(row.get("request_id") or "") == rid]
         return [dict(row) for row in items[:safe_limit]]
 
 

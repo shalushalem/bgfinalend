@@ -23,7 +23,7 @@ class AgentSystem:
 
     def _llm_plan(self, intent: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt = self._build_prompt(intent, context)
-        response = generate_text(prompt)
+        response = generate_text(prompt, usecase="intent")
 
         if not response or response == "none":
             return []
