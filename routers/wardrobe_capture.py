@@ -96,7 +96,7 @@ class DetectedItem(BaseModel):
     sub_category: str
     color_code: str
     pattern: str = "plain"
-    occasions: List[str] = ["casual"]
+    occasions: List[str] = Field(default_factory=lambda: ["casual"])
     confidence: float = 0.0
     reasoning: str
     bbox: Dict[str, int]

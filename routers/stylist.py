@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, Dict, List
 from services import ai_gateway
 from brain.outfit_pipeline import get_daily_outfits
@@ -19,8 +19,8 @@ class OutfitPipelineRequest(BaseModel):
     user_id: str
     query: str = "What should I wear today?"
     wardrobe: Any = None
-    user_profile: Dict[str, Any] = {}
-    context: Dict[str, Any] = {}
+    user_profile: Dict[str, Any] = Field(default_factory=dict)
+    context: Dict[str, Any] = Field(default_factory=dict)
 
 @router.post("/item-suggestions")
 def get_item_suggestions(request: ItemContextRequest):

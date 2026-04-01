@@ -120,8 +120,8 @@ class Message(BaseModel):
 class TextChatRequest(BaseModel):
     messages: List[Message] = Field(..., min_length=1, max_length=30)
     language: str = Field(default="en", min_length=2, max_length=8)
-    current_memory: Any = {}
-    user_profile: Dict[str, Any] = {}
+    current_memory: Any = Field(default_factory=dict)
+    user_profile: Dict[str, Any] = Field(default_factory=dict)
     user_id: str | None = None
     userID: str | None = None
     module_context: str | None = None
@@ -135,30 +135,30 @@ class OutfitFeedbackRequest(BaseModel):
 
 class OrganizeHubRequest(BaseModel):
     user_id: str
-    user_profile: Dict[str, Any] = {}
-    current_memory: Any = {}
+    user_profile: Dict[str, Any] = Field(default_factory=dict)
+    current_memory: Any = Field(default_factory=dict)
     include_counts: bool = False
 
 
 class PlanPackRequest(BaseModel):
     user_id: str
     prompt: str
-    user_profile: Dict[str, Any] = {}
-    current_memory: Any = {}
+    user_profile: Dict[str, Any] = Field(default_factory=dict)
+    current_memory: Any = Field(default_factory=dict)
 
 
 class DailyCardsRequest(BaseModel):
     user_id: str
     time_slot: str | None = None
-    user_profile: Dict[str, Any] = {}
-    current_memory: Any = {}
+    user_profile: Dict[str, Any] = Field(default_factory=dict)
+    current_memory: Any = Field(default_factory=dict)
 
 
 # -------------------------
 # CHAT ENDPOINT
 # -------------------------
 @router.post("/text")
-async def text_chat(request: TextChatRequest):
+def text_chat(request: TextChatRequest):
 
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages provided")

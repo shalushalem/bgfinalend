@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from services.board_service import (
     AppwriteProxyError,
@@ -24,7 +24,7 @@ class SaveBoardRequest(BaseModel):
     image_url: str = ""
     image_base64: str = ""
     board_ids: Optional[str] = None
-    payload: Dict[str, Any] = {}
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SaveLifeBoardRequest(BaseModel):
@@ -32,7 +32,7 @@ class SaveLifeBoardRequest(BaseModel):
     title: str
     board_type: str = "daily_wear"
     description: str = ""
-    payload: Dict[str, Any] = {}
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("")

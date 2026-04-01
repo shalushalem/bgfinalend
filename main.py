@@ -392,19 +392,19 @@ def remove_bg_compat(payload: BgCompatRequest):
         )
 
     result = remove_background_sync(image_base64)
-    if isinstance(result, dict):
-        print(
-            "BG compat result:",
-            {
-                "bg_removed": result.get("bg_removed"),
-                "fallback_reason": result.get("fallback_reason"),
-            },
+    if not isinstance(result, dict) or result.get("bg_removed") is not True:
+        fallback = result.get("fallback_reason") if isinstance(result, dict) else "Background removal failed"
+        raise HTTPException(
+            status_code=503,
+            detail=fallback or "Background removal failed",
         )
-        if result.get("bg_removed") is not True:
-            raise HTTPException(
-                status_code=503,
-                detail=result.get("fallback_reason") or "Background removal failed",
-            )
+    print(
+        "BG compat result:",
+        {
+            "bg_removed": result.get("bg_removed"),
+            "fallback_reason": result.get("fallback_reason"),
+        },
+    )
     return result
 @app.get("/")
 def root():
