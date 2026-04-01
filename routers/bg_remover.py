@@ -1,7 +1,6 @@
 ﻿import os
 import io
 import base64
-import asyncio
 import torch
 import threading
 import numpy as np
@@ -23,6 +22,10 @@ try:
     from worker import bg_remove_task
 except Exception:
     bg_remove_task = None
+try:
+    from services.job_tracker import job_tracker
+except Exception:
+    job_tracker = None
 
 try:
     import onnxruntime as ort
@@ -373,9 +376,8 @@ def remove_background_sync(image_base64: str):
 
 
 @router.post("/remove-bg")
-async def remove_background(request: BGRemoveRequest):
-    # CPU/GPU-heavy path is executed off the event loop.
-    return await asyncio.to_thread(remove_background_sync, request.image_base64)
+def remove_background(request: BGRemoveRequest):
+    return remove_background_sync(request.image_base64)
 
 
 @router.post("/remove-bg/async", status_code=status.HTTP_202_ACCEPTED)
@@ -384,6 +386,13 @@ async def remove_background_async(request: BGRemoveRequest):
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
         task = bg_remove_task.delay(request.image_base64)
+        if job_tracker is not None:
+            job_tracker.create(
+                job_id=task.id,
+                kind="bg_remove",
+                source="api:/api/background/remove-bg/async",
+                meta={"task_type": "bg_remove_task"},
+            )
         return {
             "success": True,
             "status": "queued",
@@ -392,3 +401,4 @@ async def remove_background_async(request: BGRemoveRequest):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue bg removal: {exc}")
+

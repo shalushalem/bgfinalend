@@ -3,11 +3,7 @@ import logging
 import os
 
 from brain.tone.tone_engine import tone_engine
-
-try:
-    from services import llm_service
-except Exception:
-    llm_service = None
+from services.ai_gateway import chat_completion
 
 logger = logging.getLogger("ahvi.response_assembler")
 
@@ -63,7 +59,7 @@ class ResponseAssembler:
 
     def _synthesize(self, data: dict, domains: list, user_profile: dict) -> str:
         llm_enabled = os.getenv("ENABLE_LLM_SYNTHESIS", "false").lower() in ("1", "true", "yes")
-        if not llm_enabled or llm_service is None:
+        if not llm_enabled:
             return self._fallback_synthesis(data, domains)
 
         system_prompt = (
@@ -78,7 +74,7 @@ class ResponseAssembler:
         )
 
         try:
-            return llm_service.chat_completion(
+            return chat_completion(
                 [{"role": "user", "content": prompt}],
                 system_instruction=system_prompt,
             )

@@ -1,4 +1,3 @@
-import base64
 import os
 from typing import Any, Dict, List, Optional
 
@@ -6,8 +5,9 @@ import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from services.r2_storage import R2Storage, R2StorageError
+from services.r2_storage import R2StorageError
 from services.qdrant_service import qdrant_service
+from services import upload_service
 
 router = APIRouter(tags=["utilities"])
 
@@ -33,21 +33,6 @@ class WardrobeUploadRequest(BaseModel):
     file_id: str
     raw_image_base64: str = Field(..., min_length=10)
     masked_image_base64: str = Field(..., min_length=10)
-
-
-def _decode_base64_image(value: str, *, max_bytes: int, field_name: str) -> bytes:
-    text = value or ""
-    if "," in text:
-        text = text.split(",", 1)[1]
-    try:
-        data = base64.b64decode(text, validate=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"{field_name} is not valid base64: {exc}")
-    if not data:
-        raise HTTPException(status_code=400, detail=f"{field_name} is empty")
-    if len(data) > max_bytes:
-        raise HTTPException(status_code=413, detail=f"{field_name} too large (max {max_bytes // (1024 * 1024)}MB)")
-    return data
 
 
 @router.post("/api/anthropic")
@@ -103,13 +88,10 @@ def weather(latitude: float, longitude: float):
 @router.post("/api/uploads/avatar")
 def upload_avatar(request: AvatarUploadRequest):
     try:
-        image_bytes = _decode_base64_image(
-            request.image_base64,
-            max_bytes=8 * 1024 * 1024,
-            field_name="image_base64",
+        avatar_url = upload_service.upload_avatar(
+            user_id=request.user_id,
+            image_base64=request.image_base64,
         )
-        storage = R2Storage()
-        avatar_url = storage.upload_avatar(user_id=request.user_id, image_bytes=image_bytes)
         return {"avatar_url": avatar_url}
     except R2StorageError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -120,21 +102,10 @@ def upload_avatar(request: AvatarUploadRequest):
 @router.post("/api/uploads/wardrobe")
 def upload_wardrobe_images(request: WardrobeUploadRequest):
     try:
-        raw_bytes = _decode_base64_image(
-            request.raw_image_base64,
-            max_bytes=12 * 1024 * 1024,
-            field_name="raw_image_base64",
-        )
-        masked_bytes = _decode_base64_image(
-            request.masked_image_base64,
-            max_bytes=12 * 1024 * 1024,
-            field_name="masked_image_base64",
-        )
-        storage = R2Storage()
-        result = storage.upload_wardrobe_images(
+        result = upload_service.upload_wardrobe_images(
             file_id=request.file_id,
-            raw_image_bytes=raw_bytes,
-            masked_image_bytes=masked_bytes,
+            raw_image_base64=request.raw_image_base64,
+            masked_image_base64=request.masked_image_base64,
         )
         return result
     except R2StorageError as exc:
@@ -164,7 +135,7 @@ def architecture_status():
         },
         "api_ai_processing": {
             "fastapi_backend": True,
-            "llm_service": True,
+            "ai_gateway": True,
             "vision_pipeline": True,
             "async_processing": True,
         },

@@ -14,6 +14,10 @@ except Exception:
 from brain.orchestrator import ahvi_orchestrator
 from brain.outfit_pipeline import save_feedback
 from services.appwrite_proxy import AppwriteProxy
+try:
+    from services.job_tracker import job_tracker
+except Exception:
+    job_tracker = None
 
 # 🔥 NEW
 from services.weather_service import get_hourly_weather
@@ -264,6 +268,14 @@ async def text_chat(request: TextChatRequest):
         ):
             task = run_heavy_audio_task.delay(message, target_lang)
             audio_job_id = task.id
+            if job_tracker is not None:
+                job_tracker.create(
+                    job_id=audio_job_id,
+                    kind="audio_generate",
+                    user_id=request.user_id or request.userID or "user_1",
+                    source="api:/api/text",
+                    meta={"task_type": "generate_audio"},
+                )
         else:
             audio_job_id = "offline"
     except Exception:

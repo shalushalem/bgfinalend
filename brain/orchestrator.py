@@ -108,7 +108,7 @@ class AhviOrchestrator:
             intent_data["slots"] = slots
 
             # -------------------------
-            # 🔥 SIGNALS (NEW)
+            # ðŸ”¥ SIGNALS (NEW)
             # -------------------------
             signals = {
                 "context_mode": "styling",
@@ -170,189 +170,17 @@ class AhviOrchestrator:
             # STYLING FLOWS
             # -------------------------
             if intent in ("daily_outfit", "occasion_outfit", "explore_styles"):
-                # -------------------------
-                # FETCH WARDROBE
-                # -------------------------
-                try:
-                    wardrobe_docs = appwrite.list_documents("outfits", user_id=user_id)
-                    context["wardrobe"] = wardrobe_docs
-                except Exception as e:
-                    print("ERROR fetching wardrobe:", str(e))
-                    context["wardrobe"] = []
-
-                # -------------------------
-                # CONTEXT ENGINE
-                # -------------------------
-                enriched_context = context_engine.build_context(
+                return self._styling_response(
+                    request_id=request_id,
                     user_id=user_id,
-                    intent_data=intent_data,
-                    wardrobe=context.get("wardrobe", []),
-                    user_profile=context.get("user_profile"),
-                    history=context.get("history", []),
-                    vision=context.get("vision"),
-                )
-
-                cache_key = self._cache_key(
                     text=text,
-                    user_id=user_id,
-                    context={**context, **enriched_context},
+                    context=context,
+                    intent=intent,
+                    intent_data=intent_data,
+                    appwrite=appwrite,
+                    signals=signals,
+                    started_at=started_at,
                 )
-                cached = self._get_cache(cache_key)
-                if cached is not None:
-                    cached_data = dict(cached)
-                    cached_data["meta"] = {**cached_data.get("meta", {}), "cache_hit": True}
-                    return cached_data
-
-                # -------------------------
-                # STYLE DNA
-                # -------------------------
-                style_dna = self._build_style_dna({**context, **enriched_context, "user_id": user_id})
-
-                # -------------------------
-                # PLAN
-                # -------------------------
-                plan = agent_system.plan(intent=intent, context=enriched_context)
-
-                state: Dict[str, Any] = {"pipeline_result": {}}
-
-                # -------------------------
-                # EXECUTION STEPS
-                # -------------------------
-                def _normalize_context():
-                    return {
-                        "slots": enriched_context.get("slots", {}),
-                        "meta": enriched_context.get("meta", {}),
-                    }
-
-                def _build_style_graph():
-                    return {"status": "prepared"}
-
-                def _generate_score_rank():
-                    slots_ctx = enriched_context.get("slots", {}) or {}
-
-                    state["pipeline_result"] = get_daily_outfits(
-                        {
-                            "user_id": user_id,
-                            "wardrobe": enriched_context.get("wardrobe", []),
-                            "context": {
-                                "query": text,
-                                "weather": slots_ctx.get("weather"),
-                                "occasion": slots_ctx.get("occasion"),
-                                "location": slots_ctx.get("location"),
-                                "time_of_day": slots_ctx.get("time"),
-                                "history": enriched_context.get("history", []),
-                                "recent_outfits": context.get("memory", {}).get("recent_outfits", []),
-                                "style_dna": style_dna,
-                            },
-                        }
-                    )
-
-                    return {"outfits_count": len(state["pipeline_result"].get("outfits", []))}
-
-                def _persist_hooks():
-                    return {"feedback_endpoint": "/api/feedback/outfit"}
-
-                exec_result = execution_engine.execute(
-                    plan=plan,
-                    handlers={
-                        "normalize_context": _normalize_context,
-                        "build_style_graph": _build_style_graph,
-                        "generate_score_rank": _generate_score_rank,
-                        "persist_and_feedback_hooks": _persist_hooks,
-                        "no_op": lambda: {"status": "noop"},
-                    },
-                    timeout_seconds=3.0,
-                    slow_step_threshold_seconds=1.5,
-                )
-
-                pipeline_result = state.get("pipeline_result", {})
-                outfits = pipeline_result.get("outfits", [])
-                boards = pipeline_result.get("boards", [])
-                cards_from_pipeline = pipeline_result.get("cards", [])
-
-                # -------------------------
-                # SAVE OUTFITS (UNCHANGED)
-                # -------------------------
-                saved_outfit_ids = []
-
-                try:
-                    existing_outfits = appwrite.list_documents("outfits", user_id=user_id)
-                    existing_hashes = {_hash_outfit(o) for o in existing_outfits}
-                except Exception as e:
-                    print("ERROR loading existing outfits:", str(e))
-                    existing_hashes = set()
-
-                for outfit in outfits:
-                    try:
-                        outfit_hash = _hash_outfit(outfit)
-                        if outfit_hash in existing_hashes:
-                            continue
-
-                        doc = appwrite.create_document(
-                            "outfits",
-                            {"userId": user_id, "hash": outfit_hash, **outfit}
-                        )
-
-                        saved_outfit_ids.append(doc.get("$id"))
-
-                    except Exception as e:
-                        print("ERROR saving outfit:", str(e))
-
-                # -------------------------
-                # CARDS (UNCHANGED LOGIC)
-                # -------------------------
-                cards = cards_from_pipeline if cards_from_pipeline else boards if boards else [
-                    {
-                        "title": f"Outfit {i+1}",
-                        "outfit_id": oid,
-                        "preview": outfits[i] if i < len(outfits) else {}
-                    }
-                    for i, oid in enumerate(saved_outfit_ids[:3])
-                ]
-
-                # -------------------------
-                # 🔥 AHVI MESSAGE (UPGRADE ONLY)
-                # -------------------------
-                if outfits:
-                    message = self._build_stylist_message(
-                        text=text,
-                        cards=cards,
-                        context={**context, **enriched_context},
-                        style_dna=style_dna,
-                        user_profile=context.get("user_profile"),
-                        signals=signals,
-                    )
-                else:
-                    message = "I need more wardrobe items to generate outfits."
-
-                # -------------------------
-                # RESPONSE
-                # -------------------------
-                response = {
-                    "success": True,
-                    "request_id": request_id,
-                    "meta": {
-                        "intent": intent,
-                        "domain": "styling",
-                        "cache_hit": False,
-                        "latency_ms": round((perf_counter() - started_at) * 1000.0, 2),
-                    },
-                    "message": message,
-                    "board": "outfit",
-                    "type": "boards" if boards else "cards",
-                    "cards": cards,
-                    "data": {
-                        "outfits_count": len(outfits),
-                        "execution": exec_result,
-                        "boards_available": bool(boards),
-                        "tryon_enabled": True,
-                        "pipeline": pipeline_result.get("pipeline", {}),
-                        "premium": pipeline_result.get("premium", {}),
-                    },
-                }
-
-                self._set_cache(cache_key, response)
-                return response
 
             # -------------------------
             # FALLBACK
@@ -391,6 +219,191 @@ class AhviOrchestrator:
     # -------------------------
     # HELPERS (UNCHANGED)
     # -------------------------
+    def _styling_response(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        text: str,
+        context: Dict[str, Any],
+        intent: str,
+        intent_data: Dict[str, Any],
+        appwrite: AppwriteProxy,
+        signals: Dict[str, Any],
+        started_at: float,
+    ) -> Dict[str, Any]:
+        try:
+            wardrobe_docs = appwrite.list_documents("outfits", user_id=user_id)
+            context["wardrobe"] = wardrobe_docs
+        except Exception as e:
+            print("ERROR fetching wardrobe:", str(e))
+            context["wardrobe"] = []
+
+        enriched_context = context_engine.build_context(
+            user_id=user_id,
+            intent_data=intent_data,
+            wardrobe=context.get("wardrobe", []),
+            user_profile=context.get("user_profile"),
+            history=context.get("history", []),
+            vision=context.get("vision"),
+        )
+
+        cache_key = self._cache_key(
+            text=text,
+            user_id=user_id,
+            context={**context, **enriched_context},
+        )
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            cached_data = dict(cached)
+            cached_data["meta"] = {**cached_data.get("meta", {}), "cache_hit": True}
+            return cached_data
+
+        style_dna = self._build_style_dna({**context, **enriched_context, "user_id": user_id})
+        exec_result, pipeline_result = self._execute_styling_pipeline(
+            intent=intent,
+            user_id=user_id,
+            text=text,
+            context=context,
+            enriched_context=enriched_context,
+            style_dna=style_dna,
+        )
+
+        outfits = pipeline_result.get("outfits", [])
+        boards = pipeline_result.get("boards", [])
+        cards_from_pipeline = pipeline_result.get("cards", [])
+
+        saved_outfit_ids = self._persist_outfits(
+            appwrite=appwrite,
+            user_id=user_id,
+            outfits=outfits,
+        )
+
+        cards = cards_from_pipeline if cards_from_pipeline else boards if boards else [
+            {
+                "title": f"Outfit {i+1}",
+                "outfit_id": oid,
+                "preview": outfits[i] if i < len(outfits) else {},
+            }
+            for i, oid in enumerate(saved_outfit_ids[:3])
+        ]
+
+        if outfits:
+            message = self._build_stylist_message(
+                text=text,
+                cards=cards,
+                context={**context, **enriched_context},
+                style_dna=style_dna,
+                user_profile=context.get("user_profile"),
+                signals=signals,
+            )
+        else:
+            message = "I need more wardrobe items to generate outfits."
+
+        response = {
+            "success": True,
+            "request_id": request_id,
+            "meta": {
+                "intent": intent,
+                "domain": "styling",
+                "cache_hit": False,
+                "latency_ms": round((perf_counter() - started_at) * 1000.0, 2),
+            },
+            "message": message,
+            "board": "outfit",
+            "type": "boards" if boards else "cards",
+            "cards": cards,
+            "data": {
+                "outfits_count": len(outfits),
+                "execution": exec_result,
+                "boards_available": bool(boards),
+                "tryon_enabled": True,
+                "pipeline": pipeline_result.get("pipeline", {}),
+                "premium": pipeline_result.get("premium", {}),
+            },
+        }
+        self._set_cache(cache_key, response)
+        return response
+
+    def _execute_styling_pipeline(
+        self,
+        *,
+        intent: str,
+        user_id: str,
+        text: str,
+        context: Dict[str, Any],
+        enriched_context: Dict[str, Any],
+        style_dna: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        plan = agent_system.plan(intent=intent, context=enriched_context)
+        state: Dict[str, Any] = {"pipeline_result": {}}
+
+        def _normalize_context():
+            return {
+                "slots": enriched_context.get("slots", {}),
+                "meta": enriched_context.get("meta", {}),
+            }
+
+        def _build_style_graph():
+            return {"status": "prepared"}
+
+        def _generate_score_rank():
+            slots_ctx = enriched_context.get("slots", {}) or {}
+            state["pipeline_result"] = get_daily_outfits(
+                {
+                    "user_id": user_id,
+                    "wardrobe": enriched_context.get("wardrobe", []),
+                    "context": {
+                        "query": text,
+                        "weather": slots_ctx.get("weather"),
+                        "occasion": slots_ctx.get("occasion"),
+                        "location": slots_ctx.get("location"),
+                        "time_of_day": slots_ctx.get("time"),
+                        "history": enriched_context.get("history", []),
+                        "recent_outfits": context.get("memory", {}).get("recent_outfits", []),
+                        "style_dna": style_dna,
+                    },
+                }
+            )
+            return {"outfits_count": len(state["pipeline_result"].get("outfits", []))}
+
+        exec_result = execution_engine.execute(
+            plan=plan,
+            handlers={
+                "normalize_context": _normalize_context,
+                "build_style_graph": _build_style_graph,
+                "generate_score_rank": _generate_score_rank,
+                "persist_and_feedback_hooks": lambda: {"feedback_endpoint": "/api/feedback/outfit"},
+                "no_op": lambda: {"status": "noop"},
+            },
+            timeout_seconds=3.0,
+            slow_step_threshold_seconds=1.5,
+        )
+        return exec_result, state.get("pipeline_result", {})
+
+    def _persist_outfits(self, *, appwrite: AppwriteProxy, user_id: str, outfits: list) -> list[str]:
+        saved_outfit_ids: list[str] = []
+        try:
+            existing_outfits = appwrite.list_documents("outfits", user_id=user_id)
+            existing_hashes = {_hash_outfit(o) for o in existing_outfits}
+        except Exception as e:
+            print("ERROR loading existing outfits:", str(e))
+            existing_hashes = set()
+
+        for outfit in outfits:
+            try:
+                outfit_hash = _hash_outfit(outfit)
+                if outfit_hash in existing_hashes:
+                    continue
+                doc = appwrite.create_document(
+                    "outfits",
+                    {"userId": user_id, "hash": outfit_hash, **outfit},
+                )
+                saved_outfit_ids.append(doc.get("$id"))
+            except Exception as e:
+                print("ERROR saving outfit:", str(e))
+        return saved_outfit_ids
+
     def _extract_slots(self, text: str, context: Dict[str, Any]) -> Dict[str, Any]:
         lowered = (text or "").lower()
         slots = dict((context.get("slots") or {}))

@@ -10,18 +10,17 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 
-from services.appwrite_proxy import AppwriteProxy
-from services.embedding_service import encode_metadata
-from services.image_embedding_service import encode_image_bytes
-from services.image_fingerprint import compute_pixel_hash_from_bytes
-from services.qdrant_service import qdrant_service
-from services.r2_storage import R2Storage, R2StorageError
+from services.wardrobe_persistence_service import persist_selected_items
 try:
     from worker import capture_analyze_task, capture_save_selected_task, process_upload_task
 except Exception:
     capture_analyze_task = None
     capture_save_selected_task = None
     process_upload_task = None
+try:
+    from services.job_tracker import job_tracker
+except Exception:
+    job_tracker = None
 
 try:
     from transformers import pipeline
@@ -421,6 +420,14 @@ def analyze_capture_async(request: CaptureAnalyzeRequest):
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
         task = capture_analyze_task.delay(request.user_id, request.image_base64)
+        if job_tracker is not None:
+            job_tracker.create(
+                job_id=task.id,
+                kind="capture_analyze",
+                user_id=request.user_id,
+                source="api:/api/wardrobe/capture/analyze/async",
+                meta={"task_type": "capture_analyze_task"},
+            )
         return {
             "success": True,
             "status": "queued",
@@ -429,16 +436,6 @@ def analyze_capture_async(request: CaptureAnalyzeRequest):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to queue capture analyze: {exc}")
-
-
-def _decode_simple_base64(value: str) -> bytes:
-    text = (value or "").strip()
-    if "," in text:
-        text = text.split(",", 1)[1]
-    try:
-        return base64.b64decode(text, validate=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid item base64: {exc}")
 
 
 @router.post("/save-selected")
@@ -476,166 +473,21 @@ def save_selected_core(
         raise HTTPException(status_code=400, detail="selected_item_ids cannot be empty")
 
     normalized_items = _normalize_detected_items(detected_items)
-
-    storage = R2Storage()
-    proxy = AppwriteProxy()
-    saved: List[Dict[str, Any]] = []
-    skipped_duplicates: List[Dict[str, Any]] = []
     duplicate_threshold = _duplicate_threshold()
     pixel_max_distance = _pixel_duplicate_distance()
     image_duplicate_threshold = _image_duplicate_threshold()
-
-    for item in normalized_items:
-        if item.item_id not in selected:
-            continue
-
-        raw_bytes = _decode_simple_base64(item.raw_crop_base64)
-        seg_bytes = _decode_simple_base64(item.segmented_png_base64)
-        image_vector = encode_image_bytes(seg_bytes)
-        pixel_hash = compute_pixel_hash_from_bytes(seg_bytes)
-
-        if image_vector:
-            image_duplicate = qdrant_service.find_image_duplicate(
-                image_vector,
-                user_id,
-                threshold=image_duplicate_threshold,
-            )
-            if image_duplicate.get("is_duplicate"):
-                skipped_duplicates.append(
-                    {
-                        "item_id": item.item_id,
-                        "name": item.name,
-                        "reason": "image_vector",
-                        "duplicate_point_id": image_duplicate.get("id"),
-                        "duplicate_score": float(image_duplicate.get("score") or 0.0),
-                    }
-                )
-                continue
-
-        if pixel_hash:
-            pixel_duplicate = qdrant_service.find_pixel_duplicate(
-                user_id,
-                pixel_hash,
-                max_distance=pixel_max_distance,
-            )
-            if pixel_duplicate.get("is_duplicate"):
-                skipped_duplicates.append(
-                    {
-                        "item_id": item.item_id,
-                        "name": item.name,
-                        "reason": "pixel_hash",
-                        "pixel_hash": pixel_hash,
-                        "pixel_distance": pixel_duplicate.get("distance"),
-                        "duplicate_point_id": pixel_duplicate.get("id"),
-                    }
-                )
-                continue
-
-        vector_input = {
-            "category": item.category,
-            "sub_category": item.sub_category,
-            "color_code": item.color_code,
-            "pattern": item.pattern,
-            "occasions": item.occasions,
-        }
-        vector = encode_metadata(vector_input)
-        duplicate = qdrant_service.find_duplicate(vector, user_id, threshold=duplicate_threshold)
-        if duplicate.get("is_duplicate"):
-            skipped_duplicates.append(
-                {
-                    "item_id": item.item_id,
-                    "name": item.name,
-                    "reason": "semantic",
-                    "duplicate_point_id": duplicate.get("id"),
-                    "duplicate_score": float(duplicate.get("score") or 0.0),
-                }
-            )
-            continue
-
-        file_id = str(uuid.uuid4())
-
-        try:
-            upload = storage.upload_wardrobe_images(
-                file_id=file_id,
-                raw_image_bytes=raw_bytes,
-                masked_image_bytes=seg_bytes,
-            )
-        except R2StorageError as exc:
-            raise HTTPException(status_code=500, detail=f"R2 upload failed: {exc}")
-
-        metadata = {
-            "userId": user_id,
-            "name": item.name,
-            "category": item.category,
-            "sub_category": item.sub_category,
-            "color_code": item.color_code,
-            "pattern": item.pattern,
-            "occasions": item.occasions,
-            "status": "active",
-            "image_url": upload["raw_image_url"],
-            "masked_url": upload["masked_image_url"],
-            "image_id": upload["raw_file_name"],
-            "masked_id": upload["masked_file_name"],
-            "qdrant_point_id": file_id,
-            "worn": 0,
-            "liked": False,
-        }
-
-        try:
-            doc = proxy.create_document("outfits", metadata)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Appwrite save failed: {exc}")
-
-        qdrant_service.upsert_item(
-            item_id=file_id,
-            vector=vector,
-            payload={
-                "userId": user_id,
-                "category": item.category,
-                "sub_category": item.sub_category,
-                "color_code": item.color_code,
-                "image_url": upload["masked_image_url"],
-                "pixel_hash": pixel_hash,
-            },
-        )
-        if image_vector:
-            qdrant_service.upsert_image_vector(
-                point_id=file_id,
-                vector=image_vector,
-                payload={
-                    "userId": user_id,
-                    "category": item.category,
-                    "sub_category": item.sub_category,
-                    "color_code": item.color_code,
-                    "image_url": upload["masked_image_url"],
-                    "pixel_hash": pixel_hash,
-                },
-            )
-
-        saved.append(
-            {
-                "item_id": item.item_id,
-                "outfit_doc_id": doc.get("$id"),
-                "image_url": upload["masked_image_url"],
-                "raw_image_url": upload["raw_image_url"],
-                "name": item.name,
-                "category": item.category,
-                "sub_category": item.sub_category,
-            }
-        )
-
-    return {
-        "success": True,
-        "message": f"Saved {len(saved)} selected items to wardrobe.",
-        "saved_items": saved,
-        "skipped_duplicates": skipped_duplicates,
-        "meta": {
-            "duplicate_threshold": duplicate_threshold,
-            "image_duplicate_threshold": image_duplicate_threshold,
-            "pixel_max_distance": pixel_max_distance,
-            "duplicates_skipped": len(skipped_duplicates),
-        },
-    }
+    normalized_payload = [
+        item.model_dump() if hasattr(item, "model_dump") else item.dict()
+        for item in normalized_items
+    ]
+    return persist_selected_items(
+        user_id=user_id,
+        selected_item_ids=list(selected),
+        detected_items=normalized_payload,
+        duplicate_threshold=duplicate_threshold,
+        pixel_max_distance=pixel_max_distance,
+        image_duplicate_threshold=image_duplicate_threshold,
+    )
 
 
 @router.post("/save-selected/async", status_code=status.HTTP_202_ACCEPTED)
@@ -655,6 +507,14 @@ def save_selected_async(request: SaveSelectedRequest):
             "detected_items": detected,
         }
         task = capture_save_selected_task.delay(payload)
+        if job_tracker is not None:
+            job_tracker.create(
+                job_id=task.id,
+                kind="capture_save_selected",
+                user_id=request.user_id,
+                source="api:/api/wardrobe/capture/save-selected/async",
+                meta={"task_type": "capture_save_selected_task"},
+            )
         return {
             "success": True,
             "status": "queued",
@@ -671,6 +531,14 @@ def process_upload_async(request: ProcessUploadRequest):
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
         task = process_upload_task.delay(request.user_id, request.image_base64)
+        if job_tracker is not None:
+            job_tracker.create(
+                job_id=task.id,
+                kind="process_upload",
+                user_id=request.user_id,
+                source="api:/api/wardrobe/capture/process-upload/async",
+                meta={"task_type": "process_upload"},
+            )
         return {
             "success": True,
             "status": "queued",

@@ -1,8 +1,6 @@
 from typing import Any, Dict, List
-import json
-import re
 
-from services.llm_service import generate_text
+from services.ai_gateway import generate_text, parse_json_array
 
 
 class AgentSystem:
@@ -40,8 +38,7 @@ class AgentSystem:
             return []
 
         try:
-            clean = re.sub(r"```json|```", "", str(response)).strip()
-            parsed = json.loads(clean)
+            parsed = parse_json_array(str(response))
 
             if isinstance(parsed, list):
                 return parsed

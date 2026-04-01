@@ -1,10 +1,7 @@
-import json
-import re
 import base64
 import os
 import cv2
 import numpy as np
-import requests
 
 from collections import Counter
 from fastapi import APIRouter, HTTPException, status
@@ -24,11 +21,16 @@ Do not include markdown fences or extra text.
 from services.embedding_service import encode_metadata
 from services.image_embedding_service import encode_image_base64
 from services.image_fingerprint import compute_pixel_hash_from_base64
+from services import ai_gateway
 from services.qdrant_service import qdrant_service
 try:
     from worker import vision_analyze_task
 except Exception:
     vision_analyze_task = None
+try:
+    from services.job_tracker import job_tracker
+except Exception:
+    job_tracker = None
 try:
     from routers.bg_remover import BGRemoveRequest, remove_background_sync
 except Exception:
@@ -36,19 +38,6 @@ except Exception:
     remove_background_sync = None
 
 router = APIRouter()
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api").rstrip("/")
-VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision:latest")
-VISION_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_VISION_TIMEOUT_SECONDS", "120"))
-VISION_MODEL_FALLBACKS = [
-    m.strip()
-    for m in os.getenv(
-        "OLLAMA_VISION_MODEL_FALLBACKS",
-        "llama3.2-vision:latest,llama3.2-vision",
-    ).split(",")
-    if m.strip()
-]
-
-
 def _duplicate_threshold() -> float:
     raw = str(os.getenv("WARDROBE_DUPLICATE_THRESHOLD", "0.97") or "").strip()
     try:
@@ -86,32 +75,6 @@ def _image_duplicate_threshold() -> float:
         return value
     except Exception:
         return 0.985
-
-
-def _ollama_generate_url() -> str:
-    return f"{OLLAMA_URL}/generate" if OLLAMA_URL.endswith("/api") else f"{OLLAMA_URL}/api/generate"
-
-
-def _vision_model_candidates():
-    ordered = []
-    for model in [VISION_MODEL, *VISION_MODEL_FALLBACKS]:
-        m = str(model or "").strip()
-        if m and m not in ordered:
-            ordered.append(m)
-    return ordered
-
-
-def _parse_llm_json_object(text: str):
-    raw = str(text or "").strip()
-    clean = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
-    try:
-        return json.loads(clean)
-    except Exception:
-        start = clean.find("{")
-        end = clean.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        return json.loads(clean[start : end + 1])
 
 
 class ImageAnalyzeRequest(BaseModel):
@@ -408,45 +371,13 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
     # -------------------------
     # STEP 2: LLM ANALYSIS
     # -------------------------
-    payload = {
-        "model": VISION_MODEL,
-        "prompt": getattr(prompts, "VISION_ANALYZE_PROMPT", DEFAULT_VISION_ANALYZE_PROMPT),
-        "images": [_normalize_base64_for_model(vision_input_base64)],
-        "stream": False,
-        "format": "json",
-    }
-
     llm_fallback = False
     model_used = None
     try:
-        last_error = None
-        final_data = None
-
-        for model_name in _vision_model_candidates():
-            try:
-                local_payload = dict(payload)
-                local_payload["model"] = model_name
-                response = requests.post(
-                    _ollama_generate_url(),
-                    json=local_payload,
-                    timeout=VISION_TIMEOUT_SECONDS,
-                )
-                if response.status_code >= 400:
-                    body = (response.text or "").strip()
-                    raise RuntimeError(
-                        f"Ollama generate failed for model='{model_name}' "
-                        f"status={response.status_code} body={body[:240]}"
-                    )
-                raw_response = response.json().get("response", "{}")
-                final_data = _parse_llm_json_object(raw_response)
-                model_used = model_name
-                break
-            except Exception as inner_exc:
-                last_error = inner_exc
-                continue
-
-        if final_data is None:
-            raise RuntimeError(last_error or "vision generation failed")
+        final_data, model_used = ai_gateway.ollama_vision_json(
+            prompt=getattr(prompts, "VISION_ANALYZE_PROMPT", DEFAULT_VISION_ANALYZE_PROMPT),
+            image_base64=_normalize_base64_for_model(vision_input_base64),
+        )
 
     except Exception as e:
         print(f"Image Analyze Error: {str(e)}")
@@ -593,6 +524,14 @@ def analyze_image_async(request: ImageAnalyzeRequest):
         raise HTTPException(status_code=503, detail="Celery worker not configured")
     try:
         task = vision_analyze_task.delay(request.image_base64, request.userId)
+        if job_tracker is not None:
+            job_tracker.create(
+                job_id=task.id,
+                kind="vision_analyze",
+                user_id=request.userId,
+                source="api:/api/vision/analyze-image/async",
+                meta={"task_type": "vision_analyze_task"},
+            )
         return {
             "success": True,
             "status": "queued",

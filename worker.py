@@ -7,6 +7,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from celery import Celery
 import sentry_sdk
 from sentry_sdk.integrations.celery import CeleryIntegration
+import logging
+from services.job_tracker import job_tracker
 
 try:
     from sentry_sdk.integrations.redis import RedisIntegration
@@ -47,6 +49,7 @@ if _sentry_dsn and not _sentry_client_ready:
 # CELERY INIT
 # =========================
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+logger = logging.getLogger("ahvi.worker")
 
 celery_app = Celery(
     "ahvi_tasks",
@@ -69,9 +72,37 @@ celery_app.conf.update(
 def _retry_or_fail(task, exc: Exception, *, max_retries: int = 2):
     retries = int(getattr(task.request, "retries", 0))
     if retries >= max_retries:
+        try:
+            job_tracker.mark_failed(str(getattr(task.request, "id", "")), error=str(exc))
+        except Exception:
+            pass
         raise exc
     countdown = 2 ** (retries + 1)
+    try:
+        job_tracker.mark_retrying(
+            str(getattr(task.request, "id", "")),
+            error=str(exc),
+            attempt=retries + 1,
+            max_retries=max_retries,
+        )
+    except Exception:
+        pass
     raise task.retry(exc=exc, countdown=countdown, max_retries=max_retries)
+
+
+def _mark_started(task) -> None:
+    try:
+        attempt = int(getattr(task.request, "retries", 0)) + 1
+        job_tracker.mark_started(str(getattr(task.request, "id", "")), attempt=attempt)
+    except Exception:
+        pass
+
+
+def _mark_succeeded(task, result_meta: dict | None = None) -> None:
+    try:
+        job_tracker.mark_succeeded(str(getattr(task.request, "id", "")), result_meta=result_meta or {})
+    except Exception:
+        pass
 
 
 # =========================
@@ -81,11 +112,13 @@ def _retry_or_fail(task, exc: Exception, *, max_retries: int = 2):
 def run_heavy_audio_task(self, text_to_clone, lang):
     from services import audio_service
 
+    _mark_started(self)
     try:
         audio_base64 = audio_service.generate_cloned_audio(text_to_clone, lang)
+        _mark_succeeded(self, {"task": "generate_audio"})
         return {"status": "success", "audio_base64": audio_base64}
     except Exception as e:
-        print("AUDIO TASK ERROR:", str(e))
+        logger.exception("AUDIO TASK ERROR")
         _retry_or_fail(self, e)
 
 
@@ -96,11 +129,13 @@ def run_heavy_audio_task(self, text_to_clone, lang):
 def bg_remove_task(self, image_base64: str):
     from routers.bg_remover import remove_background_sync
 
+    _mark_started(self)
     try:
         result = remove_background_sync(image_base64)
+        _mark_succeeded(self, {"task": "bg_remove_task"})
         return {"status": "success", "result": result}
     except Exception as e:
-        print("BG TASK ERROR:", str(e))
+        logger.exception("BG TASK ERROR")
         _retry_or_fail(self, e)
 
 
@@ -108,11 +143,13 @@ def bg_remove_task(self, image_base64: str):
 def vision_analyze_task(self, image_base64: str, user_id: str = "demo_user"):
     from routers.vision import vision_analyze_core
 
+    _mark_started(self)
     try:
         result = vision_analyze_core(image_base64=image_base64, user_id=user_id)
+        _mark_succeeded(self, {"task": "vision_analyze_task", "user_id": user_id})
         return {"status": "success", "result": result}
     except Exception as e:
-        print("VISION TASK ERROR:", str(e))
+        logger.exception("VISION TASK ERROR")
         _retry_or_fail(self, e)
 
 
@@ -120,11 +157,13 @@ def vision_analyze_task(self, image_base64: str, user_id: str = "demo_user"):
 def capture_analyze_task(self, user_id: str, image_base64: str):
     from routers.wardrobe_capture import analyze_capture_core
 
+    _mark_started(self)
     try:
         result = analyze_capture_core(user_id=user_id, image_base64=image_base64)
+        _mark_succeeded(self, {"task": "capture_analyze_task", "user_id": user_id})
         return {"status": "success", "result": result}
     except Exception as e:
-        print("CAPTURE ANALYZE TASK ERROR:", str(e))
+        logger.exception("CAPTURE ANALYZE TASK ERROR")
         _retry_or_fail(self, e)
 
 
@@ -132,6 +171,7 @@ def capture_analyze_task(self, user_id: str, image_base64: str):
 def capture_save_selected_task(self, payload: dict):
     from routers.wardrobe_capture import save_selected_core
 
+    _mark_started(self)
     try:
         user_id = str(payload.get("user_id", ""))
         selected_item_ids = payload.get("selected_item_ids", []) or []
@@ -141,9 +181,10 @@ def capture_save_selected_task(self, payload: dict):
             selected_item_ids=selected_item_ids,
             detected_items=detected_items_raw,
         )
+        _mark_succeeded(self, {"task": "capture_save_selected_task", "user_id": user_id})
         return {"status": "success", "result": result}
     except Exception as e:
-        print("CAPTURE SAVE TASK ERROR:", str(e))
+        logger.exception("CAPTURE SAVE TASK ERROR")
         _retry_or_fail(self, e)
 
 
@@ -157,6 +198,7 @@ def process_upload_task(self, user_id: str, image_base64: str):
     2) Auto-select all detected items
     3) Save selected items
     """
+    _mark_started(self)
     try:
         from routers.wardrobe_capture import analyze_capture_core, save_selected_core
 
@@ -170,11 +212,14 @@ def process_upload_task(self, user_id: str, image_base64: str):
             detected_items=items,
         )
 
-        return {
+        result = {
             "status": "success",
             "analysis": analysis_result,
             "save": {"status": "success", "result": saved_result},
         }
+        _mark_succeeded(self, {"task": "process_upload", "user_id": user_id})
+        return result
     except Exception as e:
-        print("PROCESS UPLOAD TASK ERROR:", str(e))
+        logger.exception("PROCESS UPLOAD TASK ERROR")
         _retry_or_fail(self, e)
+

@@ -1,7 +1,7 @@
 import json
 from typing import Dict, Any
 
-from services.llm_service import generate_text
+from services.ai_gateway import generate_text
 
 
 INTENT_PROMPT = """

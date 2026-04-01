@@ -1,5 +1,3 @@
-import json
-import re
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, List
@@ -24,20 +22,6 @@ class OutfitPipelineRequest(BaseModel):
     user_profile: Dict[str, Any] = {}
     context: Dict[str, Any] = {}
 
-
-def _parse_llm_json_object(text: str) -> Dict[str, Any]:
-    raw = str(text or "").strip()
-    clean = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
-    try:
-        return json.loads(clean)
-    except Exception:
-        start = clean.find("{")
-        end = clean.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        return json.loads(clean[start : end + 1])
-
-
 @router.post("/item-suggestions")
 def get_item_suggestions(request: ItemContextRequest):
     system_instruction = (
@@ -57,15 +41,12 @@ def get_item_suggestions(request: ItemContextRequest):
     
     try:
         messages = [{"role": "user", "content": user_prompt}]
-        # Using the much faster, cheaper text model
-        response_text = ai_gateway.chat_completion(
+        return ai_gateway.chat_json_object(
             messages,
             system_instruction=system_instruction,
             model="llama3.1",
         )
-        
-        return _parse_llm_json_object(response_text)
-        
+
     except Exception as e:
         print(f"Stylist Text Engine Error: {str(e)}")
         # Safe fallback

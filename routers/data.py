@@ -19,6 +19,7 @@ from services.image_fingerprint import (
 )
 from services.qdrant_service import qdrant_service
 from services.r2_storage import R2Storage, R2StorageError
+from services import data_access_service
 
 router = APIRouter(prefix="/api/data", tags=["data"])
 proxy = AppwriteProxy()
@@ -1060,7 +1061,11 @@ def get_document(resource: str, document_id: str):
                 "lang": "en",
             }
             try:
-                created = proxy.create_document("users", default_doc, document_id=document_id)
+                created = data_access_service.create_document(
+                    resource="users",
+                    payload=default_doc,
+                    document_id=document_id,
+                )
                 return {"document": created}
             except AppwriteProxyError as create_exc:
                 print(
@@ -1289,9 +1294,9 @@ def create_document(request: CreateRequest):
             payload.setdefault("masked_id", str(uuid.uuid4()))
             payload.setdefault("qdrant_point_id", str(uuid.uuid4()))
 
-        doc = proxy.create_document(
-            resource,
-            payload,
+        doc = data_access_service.create_document(
+            resource=resource,
+            payload=payload,
             document_id=request.document_id or "unique()",
         )
 
@@ -1343,7 +1348,11 @@ def create_document(request: CreateRequest):
                 # Persist the Qdrant point id if schema has this attribute.
                 if isinstance(doc, dict) and "qdrant_point_id" in doc and str(doc.get("qdrant_point_id") or "") != point_id:
                     try:
-                        doc = proxy.update_document("outfits", doc.get("$id"), {"qdrant_point_id": point_id})
+                        doc = data_access_service.update_document(
+                            resource="outfits",
+                            document_id=doc.get("$id"),
+                            payload={"qdrant_point_id": point_id},
+                        )
                     except AppwriteProxyError as exc:
                         print(f"[data.create_document] outfits qdrant_point_id update skipped: {exc}")
             except Exception as exc:
@@ -1380,7 +1389,11 @@ def update_document(document_id: str, request: UpdateRequest):
             payload = _normalize_outfit_payload(payload, None)
         elif resource == "meal_plans":
             payload = _normalize_meal_plan_payload(payload, None)
-        doc = proxy.update_document(resource, document_id, payload)
+        doc = data_access_service.update_document(
+            resource=resource,
+            document_id=document_id,
+            payload=payload,
+        )
         return {"document": doc}
     except AppwriteProxyError as exc:
         print(f"[data.update_document] resource={request.resource} normalized={resource} document_id={document_id} error={exc}")
@@ -1448,7 +1461,10 @@ def delete_document(request: DeleteRequest):
                 delete_meta["r2_error"] = str(exc)
                 print(f"[data.delete_document] outfits r2 delete failed: {exc}")
 
-        proxy.delete_document(resource, request.document_id)
+        data_access_service.delete_document(
+            resource=resource,
+            document_id=request.document_id,
+        )
         response: Dict[str, Any] = {"ok": True}
         if resource == "outfits":
             response["meta"] = delete_meta
@@ -1461,10 +1477,7 @@ def delete_document(request: DeleteRequest):
 @router.put("/users/{user_id}")
 def upsert_user_profile(user_id: str, body: Dict[str, Any]):
     try:
-        try:
-            doc = proxy.update_document("users", user_id, body)
-        except AppwriteProxyError:
-            doc = proxy.create_document("users", body, document_id=user_id)
+        doc = data_access_service.upsert_user_profile(user_id=user_id, payload=body)
         return {"document": doc}
     except AppwriteProxyError as exc:
         print(f"[data.upsert_user_profile] user_id={user_id} error={exc}")

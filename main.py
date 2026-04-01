@@ -16,6 +16,7 @@ from services.qdrant_service import qdrant_service
 from services.security_limits import check_rate_limit, extract_client_ip
 from services.settings import settings
 from middleware.auth_middleware import get_current_user
+from services.job_tracker import job_tracker
 
 
 # -------------------------
@@ -374,7 +375,7 @@ class BgCompatRequest(BaseModel):
 
 @app.post("/api/background/remove-bg")
 @app.post("/api/remove-bg")
-async def remove_bg_compat(payload: BgCompatRequest):
+def remove_bg_compat(payload: BgCompatRequest):
     """
     Always expose background-removal endpoint even when optional router gating
     prevents router mounting. This keeps frontend flow stable.
@@ -390,7 +391,7 @@ async def remove_bg_compat(payload: BgCompatRequest):
             detail=f"BG remover unavailable: {exc}",
         )
 
-    result = await asyncio.to_thread(remove_background_sync, image_base64)
+    result = remove_background_sync(image_base64)
     if isinstance(result, dict):
         print(
             "BG compat result:",
@@ -420,32 +421,63 @@ def health_check():
 # -------------------------
 @app.get("/api/tasks/{job_id}")
 def get_task_status(job_id: str):
+    tracker_data = job_tracker.get(job_id) or {}
     if not celery_app or AsyncResult is None:
+        if tracker_data:
+            return {"status": tracker_data.get("status", "queued"), "state": tracker_data.get("state", "PENDING"), "job": tracker_data}
         return {"status": "celery not configured"}
 
     task_result = AsyncResult(job_id, app=celery_app)
 
     if task_result.state == "PENDING":
-        return {"status": "queued", "state": "PENDING"}
+        return {
+            "status": str(tracker_data.get("status") or "queued"),
+            "state": "PENDING",
+            "job": tracker_data,
+        }
 
     if task_result.state == "STARTED":
         return {
             "status": "processing",
             "state": "STARTED",
             "meta": task_result.info if isinstance(task_result.info, dict) else {},
+            "job": tracker_data,
         }
 
     if task_result.state == "SUCCESS":
-        return {"status": "completed", "state": "SUCCESS", "result": task_result.result}
+        return {
+            "status": "completed",
+            "state": "SUCCESS",
+            "result": task_result.result,
+            "job": tracker_data,
+        }
 
     if task_result.state == "FAILURE":
-        return {"status": "failed", "state": "FAILURE", "error": str(task_result.info)}
+        return {
+            "status": "failed",
+            "state": "FAILURE",
+            "error": str(task_result.info),
+            "job": tracker_data,
+        }
 
     if task_result.state == "RETRY":
         return {
             "status": "retrying",
             "state": "RETRY",
             "error": str(task_result.info),
+            "job": tracker_data,
         }
 
-    return {"status": "processing", "state": task_result.state}
+    return {
+        "status": str(tracker_data.get("status") or "processing"),
+        "state": task_result.state,
+        "job": tracker_data,
+    }
+
+
+@app.get("/api/jobs/recent")
+def list_recent_jobs(limit: int = 25, user_id: str | None = None):
+    return {
+        "success": True,
+        "jobs": job_tracker.list_recent(limit=limit, user_id=user_id),
+    }
