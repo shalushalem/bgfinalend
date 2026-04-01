@@ -6,4 +6,4 @@ RMBG_2_0/onnx/
 .venv/
 __pycache__/
 *.pyc
-.env    
+.env

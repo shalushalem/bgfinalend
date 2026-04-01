@@ -1,6 +1,7 @@
 ﻿import os
 import io
 import base64
+import asyncio
 import torch
 import threading
 import numpy as np
@@ -248,8 +249,7 @@ def _original_png_response(image_data: bytes, reason: str):
     except Exception:
         raise HTTPException(status_code=500, detail="Processing failed")
 
-@router.post("/remove-bg")
-async def remove_background(request: BGRemoveRequest):
+def remove_background_sync(image_base64: str):
     global onnx_runtime_disabled
     model_instance = load_model() if USE_TORCH_MODEL else None
     onnx_instance = None
@@ -259,7 +259,7 @@ async def remove_background(request: BGRemoveRequest):
 
     try:
         try:
-            base64_data = request.image_base64.split(",")[-1]
+            base64_data = image_base64.split(",")[-1]
             image_data = base64.b64decode(base64_data)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid base64 image")
@@ -365,11 +365,17 @@ async def remove_background(request: BGRemoveRequest):
     except Exception as e:
         print("BG error:", e)
         try:
-            base64_data = request.image_base64.split(",")[-1]
+            base64_data = image_base64.split(",")[-1]
             image_data = base64.b64decode(base64_data)
             return _original_png_response(image_data, f"Unhandled BG error: {e}")
         except Exception:
             raise HTTPException(status_code=500, detail="Processing failed")
+
+
+@router.post("/remove-bg")
+async def remove_background(request: BGRemoveRequest):
+    # CPU/GPU-heavy path is executed off the event loop.
+    return await asyncio.to_thread(remove_background_sync, request.image_base64)
 
 
 @router.post("/remove-bg/async", status_code=status.HTTP_202_ACCEPTED)

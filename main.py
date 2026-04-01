@@ -1,3 +1,6 @@
+import asyncio
+from typing import Callable
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +11,8 @@ import os
 
 # ?? QDRANT SERVICE
 from services.qdrant_service import qdrant_service
+from services.security_limits import check_rate_limit, extract_client_ip
+from services.settings import settings
 
 
 # -------------------------
@@ -109,6 +114,78 @@ app = FastAPI(
 
 print("AHVI Backend Started")
 
+class PayloadTooLargeError(Exception):
+    pass
+
+
+class StreamBodyLimitMiddleware:
+    def __init__(self, app: Callable, max_bytes: int):
+        self.app = app
+        self.max_bytes = int(max_bytes)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "")).upper()
+        if method not in {"POST", "PUT", "PATCH"}:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {}
+        for k, v in scope.get("headers", []):
+            try:
+                headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+            except Exception:
+                continue
+
+        content_length = headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_bytes:
+                    response = JSONResponse(
+                        status_code=413,
+                        content={
+                            "success": False,
+                            "error": {
+                                "code": "PAYLOAD_TOO_LARGE",
+                                "message": f"Upload exceeds max size {self.max_bytes} bytes",
+                            },
+                        },
+                    )
+                    await response(scope, receive, send)
+                    return
+            except Exception:
+                pass
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                chunk = message.get("body", b"") or b""
+                received += len(chunk)
+                if received > self.max_bytes:
+                    raise PayloadTooLargeError()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except PayloadTooLargeError:
+            response = JSONResponse(
+                status_code=413,
+                content={
+                    "success": False,
+                    "error": {
+                        "code": "PAYLOAD_TOO_LARGE",
+                        "message": f"Upload exceeds max size {self.max_bytes} bytes",
+                    },
+                },
+            )
+            await response(scope, receive, send)
+
 
 # -------------------------
 # STARTUP / SHUTDOWN EVENTS
@@ -118,7 +195,7 @@ async def startup_event():
     print("Starting AHVI services...")
 
     try:
-        qdrant_service.init()
+        await asyncio.to_thread(qdrant_service.init)
     except Exception as e:
         print("Qdrant startup failed:", str(e))
 
@@ -126,6 +203,21 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     print("AHVI shutting down...")
+    try:
+        client = getattr(qdrant_service, "client", None)
+        if client is not None and hasattr(client, "close"):
+            await asyncio.to_thread(client.close)
+    except Exception as e:
+        print("Qdrant shutdown failed:", str(e))
+    try:
+        from services import appwrite_service  # local import to avoid circulars
+        appwrite_client = getattr(appwrite_service, "client", None)
+        if appwrite_client is not None and hasattr(appwrite_client, "close"):
+            await asyncio.to_thread(appwrite_client.close)
+        else:
+            print("Appwrite shutdown skip: client.close() unavailable")
+    except Exception as e:
+        print("Appwrite shutdown skip:", str(e))
 
 
 # -------------------------
@@ -171,6 +263,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(StreamBodyLimitMiddleware, max_bytes=settings.upload_max_bytes)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if not settings.rate_limit_enabled:
+        return await call_next(request)
+    ip = extract_client_ip(request.headers, request.client.host if request.client else None)
+    allowed, remaining = await check_rate_limit(
+        bucket_key=f"{ip}:{request.url.path}",
+        max_requests=settings.rate_limit_max_requests,
+        window_seconds=settings.rate_limit_window_seconds,
+    )
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "success": False,
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": "Too many requests. Please retry later.",
+                },
+            },
+            headers={"X-RateLimit-Remaining": str(remaining)},
+        )
+    response = await call_next(request)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    return response
 
 
 # -------------------------
@@ -233,7 +354,7 @@ async def remove_bg_compat(payload: dict):
         raise HTTPException(status_code=400, detail="image_base64 is required")
 
     try:
-        from routers.bg_remover import BGRemoveRequest, remove_background
+        from routers.bg_remover import remove_background_sync
     except Exception as exc:
         # Return a hard failure so clients do not treat this as a successful cutout.
         raise HTTPException(
@@ -241,8 +362,7 @@ async def remove_bg_compat(payload: dict):
             detail=f"BG remover unavailable: {exc}",
         )
 
-    req = BGRemoveRequest(image_base64=image_base64)
-    result = await remove_background(req)
+    result = await asyncio.to_thread(remove_background_sync, image_base64)
     if isinstance(result, dict):
         print(
             "BG compat result:",

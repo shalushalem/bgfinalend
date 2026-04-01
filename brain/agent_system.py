@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 import json
+import re
 
 from services.llm_service import generate_text
 
@@ -39,7 +40,8 @@ class AgentSystem:
             return []
 
         try:
-            parsed = json.loads(response)
+            clean = re.sub(r"```json|```", "", str(response)).strip()
+            parsed = json.loads(clean)
 
             if isinstance(parsed, list):
                 return parsed

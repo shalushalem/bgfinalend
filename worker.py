@@ -1,6 +1,5 @@
 ﻿import sys
 import os
-import asyncio
 
 # Ensure project root is in path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -79,11 +78,10 @@ def run_heavy_audio_task(text_to_clone, lang):
 # =========================
 @celery_app.task(name="bg_remove_task")
 def bg_remove_task(image_base64: str):
-    from routers.bg_remover import BGRemoveRequest, remove_background
+    from routers.bg_remover import remove_background_sync
 
     try:
-        req = BGRemoveRequest(image_base64=image_base64)
-        result = asyncio.run(remove_background(req))
+        result = remove_background_sync(image_base64)
         return {"status": "success", "result": result}
     except Exception as e:
         print("BG TASK ERROR:", str(e))
@@ -92,11 +90,10 @@ def bg_remove_task(image_base64: str):
 
 @celery_app.task(name="vision_analyze_task")
 def vision_analyze_task(image_base64: str, user_id: str = "demo_user"):
-    from routers.vision import ImageAnalyzeRequest, analyze_image
+    from routers.vision import vision_analyze_core
 
     try:
-        req = ImageAnalyzeRequest(image_base64=image_base64, userId=user_id)
-        result = analyze_image(req)
+        result = vision_analyze_core(image_base64=image_base64, user_id=user_id)
         return {"status": "success", "result": result}
     except Exception as e:
         print("VISION TASK ERROR:", str(e))
@@ -105,11 +102,10 @@ def vision_analyze_task(image_base64: str, user_id: str = "demo_user"):
 
 @celery_app.task(name="capture_analyze_task")
 def capture_analyze_task(user_id: str, image_base64: str):
-    from routers.wardrobe_capture import CaptureAnalyzeRequest, analyze_capture
+    from routers.wardrobe_capture import analyze_capture_core
 
     try:
-        req = CaptureAnalyzeRequest(user_id=user_id, image_base64=image_base64)
-        result = analyze_capture(req)
+        result = analyze_capture_core(user_id=user_id, image_base64=image_base64)
         return {"status": "success", "result": result}
     except Exception as e:
         print("CAPTURE ANALYZE TASK ERROR:", str(e))
@@ -118,20 +114,17 @@ def capture_analyze_task(user_id: str, image_base64: str):
 
 @celery_app.task(name="capture_save_selected_task")
 def capture_save_selected_task(payload: dict):
-    from routers.wardrobe_capture import DetectedItem, SaveSelectedRequest, save_selected
+    from routers.wardrobe_capture import save_selected_core
 
     try:
         user_id = str(payload.get("user_id", ""))
         selected_item_ids = payload.get("selected_item_ids", []) or []
         detected_items_raw = payload.get("detected_items", []) or []
-        detected_items = [DetectedItem(**item) for item in detected_items_raw]
-
-        req = SaveSelectedRequest(
+        result = save_selected_core(
             user_id=user_id,
             selected_item_ids=selected_item_ids,
-            detected_items=detected_items,
+            detected_items=detected_items_raw,
         )
-        result = save_selected(req)
         return {"status": "success", "result": result}
     except Exception as e:
         print("CAPTURE SAVE TASK ERROR:", str(e))
@@ -149,26 +142,22 @@ def process_upload_task(user_id: str, image_base64: str):
     3) Save selected items
     """
     try:
-        analyzed = capture_analyze_task(user_id=user_id, image_base64=image_base64)
-        if analyzed.get("status") != "success":
-            return analyzed
+        from routers.wardrobe_capture import analyze_capture_core, save_selected_core
 
-        analysis_result = analyzed.get("result", {})
+        analysis_result = analyze_capture_core(user_id=user_id, image_base64=image_base64)
         items = analysis_result.get("items", []) or []
         selected_ids = [i.get("item_id") for i in items if i.get("item_id")]
 
-        saved = capture_save_selected_task(
-            payload={
-                "user_id": user_id,
-                "selected_item_ids": selected_ids,
-                "detected_items": items,
-            }
+        saved_result = save_selected_core(
+            user_id=user_id,
+            selected_item_ids=selected_ids,
+            detected_items=items,
         )
 
         return {
             "status": "success",
             "analysis": analysis_result,
-            "save": saved,
+            "save": {"status": "success", "result": saved_result},
         }
     except Exception as e:
         print("PROCESS UPLOAD TASK ERROR:", str(e))

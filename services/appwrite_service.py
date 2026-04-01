@@ -39,3 +39,31 @@ if _appwrite_api_key:
 
 account = Account(client)
 databases = Databases(client)
+
+
+def _build_client() -> Client:
+    local_client = Client()
+    local_client.set_endpoint(
+        _env_first(
+            "APPWRITE_ENDPOINT",
+            "EXPO_PUBLIC_APPWRITE_ENDPOINT",
+            default="https://cloud.appwrite.io/v1",
+        )
+    )
+    local_client.set_project(
+        _env_first(
+            "APPWRITE_PROJECT_ID",
+            "APPWRITE_PROJECT",
+            "EXPO_PUBLIC_APPWRITE_PROJECT_ID",
+            default="69958f25003190519213",
+        )
+    )
+    if _appwrite_api_key:
+        local_client.set_key(_appwrite_api_key)
+    return local_client
+
+
+def build_account_for_jwt(token: str) -> Account:
+    local_client = _build_client()
+    local_client.set_jwt(str(token or "").strip())
+    return Account(local_client)

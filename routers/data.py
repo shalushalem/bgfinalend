@@ -23,6 +23,27 @@ from services.r2_storage import R2Storage, R2StorageError
 router = APIRouter(prefix="/api/data", tags=["data"])
 proxy = AppwriteProxy()
 
+RESOURCE_ALIASES = {
+    "meal_planner": "meal_plans",
+    "meal": "meal_plans",
+    "medicines": "meds",
+    "medicine": "meds",
+    "calendar": "plans",
+    "workout": "workout_outfits",
+    "workouts": "workout_outfits",
+    "skincare": "skincare_profiles",
+    "skin": "skincare_profiles",
+    "skincare_profile": "skincare_profiles",
+    "contacts": "users",
+    "life_board": "life_boards",
+    "lifeboard": "life_boards",
+}
+
+
+def _normalize_resource_key(resource: str) -> str:
+    key = str(resource or "").strip()
+    return RESOURCE_ALIASES.get(key, key)
+
 
 class CreateRequest(BaseModel):
     resource: str
@@ -254,6 +275,98 @@ def _normalize_outfit_payload(payload: Dict[str, Any], request_user_id: Optional
     normalized.pop("image_base64", None)
     normalized.pop("image_vector", None)
     normalized.pop("imageVector", None)
+
+    return normalized
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value or "").strip()
+        if not text:
+            return default
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def _normalize_meal_plan_payload(payload: Dict[str, Any], request_user_id: Optional[str]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+
+    # userId (required)
+    user_id = (
+        str(
+            normalized.get("userId")
+            or normalized.get("user_id")
+            or normalized.get("userid")
+            or request_user_id
+            or ""
+        ).strip()
+    )
+    if user_id:
+        normalized["userId"] = user_id
+
+    # Required schema fields
+    name = str(
+        normalized.get("name")
+        or normalized.get("title")
+        or normalized.get("planName")
+        or normalized.get("dietName")
+        or ""
+    ).strip()
+    desc = str(
+        normalized.get("desc")
+        or normalized.get("description")
+        or normalized.get("notes")
+        or ""
+    ).strip()
+    plan_type = str(
+        normalized.get("planType")
+        or normalized.get("plan_type")
+        or normalized.get("type")
+        or normalized.get("dietType")
+        or "diet"
+    ).strip()
+    total_cal = _safe_int(
+        normalized.get("totalCal")
+        if normalized.get("totalCal") is not None
+        else normalized.get("total_cal", normalized.get("calories", 0)),
+        default=0,
+    )
+
+    # meals[] column is a string in your table. Persist as compact JSON string.
+    meals_value = normalized.get("meals[]", None)
+    if meals_value is None:
+        meals_value = normalized.get("meals", normalized.get("items", []))
+    if isinstance(meals_value, str):
+        meals_str = meals_value.strip()
+    else:
+        try:
+            meals_str = json.dumps(meals_value if meals_value is not None else [], ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            meals_str = "[]"
+
+    normalized["name"] = name or "Diet Plan"
+    normalized["desc"] = desc or "Diet plan details"
+    normalized["planType"] = plan_type or "diet"
+    normalized["totalCal"] = int(total_cal)
+    normalized["meals[]"] = meals_str
+
+    # Remove aliases/unsupported keys that can break strict schemas.
+    normalized.pop("title", None)
+    normalized.pop("description", None)
+    normalized.pop("notes", None)
+    normalized.pop("plan_type", None)
+    normalized.pop("dietType", None)
+    normalized.pop("total_cal", None)
+    normalized.pop("calories", None)
+    normalized.pop("meals", None)
+    normalized.pop("items", None)
+    normalized.pop("user_id", None)
+    normalized.pop("userid", None)
 
     return normalized
 
@@ -890,8 +1003,9 @@ def list_documents(
     offset: int = 0,
 ):
     try:
+        normalized_resource = _normalize_resource_key(resource)
         page = proxy.list_documents(
-            resource,
+            normalized_resource,
             user_id=user_id,
             occasion=occasion,
             limit=limit,
@@ -902,7 +1016,7 @@ def list_documents(
             docs = page.get("documents", [])
             meta = page.get("meta", {})
             print(
-                f"[data.list_documents] resource={resource} user_id={user_id} "
+                f"[data.list_documents] resource={resource} normalized={normalized_resource} user_id={user_id} "
                 f"offset={offset} limit={limit} returned={len(docs)} "
                 f"mode={meta.get('mode')} total={meta.get('total')}"
             )
@@ -918,16 +1032,42 @@ def list_documents(
             },
         }
     except AppwriteProxyError as exc:
-        print(f"[data.list_documents] resource={resource} user_id={user_id} error={exc}")
+        print(f"[data.list_documents] resource={resource} normalized={normalized_resource} user_id={user_id} error={exc}")
         raise _http_error_from_proxy(exc)
 
 
 @router.get("/{resource}/{document_id}")
 def get_document(resource: str, document_id: str):
     try:
-        doc = proxy.get_document(resource, document_id)
+        normalized_resource = _normalize_resource_key(resource)
+        doc = proxy.get_document(normalized_resource, document_id)
         return {"document": doc}
     except AppwriteProxyError as exc:
+        if resource == "users" and "(404)" in str(exc):
+            default_doc = {
+                "name": "",
+                "username": "",
+                "email": "",
+                "phone": "",
+                "dob": "",
+                "gender": "",
+                "skinTone": 3,
+                "bodyShape": "",
+                "styles": [],
+                "shopPrefs": [],
+                "isDark": True,
+                "theme": "coolBlue",
+                "lang": "en",
+            }
+            try:
+                created = proxy.create_document("users", default_doc, document_id=document_id)
+                return {"document": created}
+            except AppwriteProxyError as create_exc:
+                print(
+                    f"[data.get_document] resource={resource} document_id={document_id} "
+                    f"create_on_missing error={create_exc}"
+                )
+                raise _http_error_from_proxy(create_exc)
         print(f"[data.get_document] resource={resource} document_id={document_id} error={exc}")
         raise _http_error_from_proxy(exc)
 
@@ -988,15 +1128,16 @@ def check_outfit_duplicate(request: OutfitDuplicateCheckRequest):
 @router.post("")
 def create_document(request: CreateRequest):
     try:
+        resource = _normalize_resource_key(request.resource)
         payload = dict(request.data)
-        if request.resource == "outfits":
+        if resource == "outfits":
             print(
                 f"[data.create_document] outfits request "
                 f"force_save={bool(request.force_save)} "
                 f"user_id={request.user_id or payload.get('userId') or payload.get('user_id')}"
             )
         incoming_image_vector: list = []
-        if request.resource == "outfits":
+        if resource == "outfits":
             incoming_image_vector = (
                 _coerce_vector(payload.get("image_vector"))
                 or _coerce_vector(payload.get("imageVector"))
@@ -1028,7 +1169,7 @@ def create_document(request: CreateRequest):
             "error": None,
         }
 
-        if request.resource == "outfits":
+        if resource == "outfits":
             payload = _normalize_outfit_payload(payload, request.user_id)
 
             duplicate_user_id = str(payload.get("userId") or request.user_id or "").strip()
@@ -1134,11 +1275,13 @@ def create_document(request: CreateRequest):
                 )
                 if duplicate_meta.get("error"):
                     print(f"[data.create_document] outfits duplicate check failed: {duplicate_meta.get('error')}")
+        elif resource == "meal_plans":
+            payload = _normalize_meal_plan_payload(payload, request.user_id)
 
-        user_field = proxy.user_field_map.get(request.resource)
+        user_field = proxy.user_field_map.get(resource)
         if request.user_id and user_field and user_field not in payload:
             payload[user_field] = request.user_id
-        if request.resource == "outfits":
+        if resource == "outfits":
             payload.setdefault("status", "active")
             payload.setdefault("worn", 0)
             payload.setdefault("liked", False)
@@ -1147,7 +1290,7 @@ def create_document(request: CreateRequest):
             payload.setdefault("qdrant_point_id", str(uuid.uuid4()))
 
         doc = proxy.create_document(
-            request.resource,
+            resource,
             payload,
             document_id=request.document_id or "unique()",
         )
@@ -1157,7 +1300,7 @@ def create_document(request: CreateRequest):
         image_qdrant_saved = False
         image_qdrant_error = None
         point_id = None
-        if request.resource == "outfits":
+        if resource == "outfits":
             try:
                 if not payload_image_vector:
                     payload_image_vector = incoming_image_vector or _compute_payload_image_vector(payload)
@@ -1212,7 +1355,8 @@ def create_document(request: CreateRequest):
             "document": doc,
             "meta": {
                 "saved": True,
-                "duplicate": duplicate_meta if request.resource == "outfits" else None,
+                "duplicate": duplicate_meta if resource == "outfits" else None,
+                "resource": resource,
                 "qdrant_saved": qdrant_saved,
                 "qdrant_error": qdrant_error,
                 "image_qdrant_saved": image_qdrant_saved,
@@ -1223,28 +1367,32 @@ def create_document(request: CreateRequest):
     except HTTPException:
         raise
     except AppwriteProxyError as exc:
-        print(f"[data.create_document] resource={request.resource} error={exc}")
+        print(f"[data.create_document] resource={request.resource} normalized={resource} error={exc}")
         raise _http_error_from_proxy(exc)
 
 
 @router.patch("/{document_id}")
 def update_document(document_id: str, request: UpdateRequest):
     try:
+        resource = _normalize_resource_key(request.resource)
         payload = dict(request.data)
-        if request.resource == "outfits":
+        if resource == "outfits":
             payload = _normalize_outfit_payload(payload, None)
-        doc = proxy.update_document(request.resource, document_id, payload)
+        elif resource == "meal_plans":
+            payload = _normalize_meal_plan_payload(payload, None)
+        doc = proxy.update_document(resource, document_id, payload)
         return {"document": doc}
     except AppwriteProxyError as exc:
-        print(f"[data.update_document] resource={request.resource} document_id={document_id} error={exc}")
+        print(f"[data.update_document] resource={request.resource} normalized={resource} document_id={document_id} error={exc}")
         raise _http_error_from_proxy(exc)
 
 
 @router.delete("")
 def delete_document(request: DeleteRequest):
     try:
+        resource = _normalize_resource_key(request.resource)
         delete_meta: Dict[str, Any] = {}
-        if request.resource == "outfits":
+        if resource == "outfits":
             delete_meta = {
                 "qdrant_deleted": False,
                 "qdrant_error": None,
@@ -1257,7 +1405,7 @@ def delete_document(request: DeleteRequest):
             }
             doc: Dict[str, Any] = {}
             try:
-                doc = proxy.get_document(request.resource, request.document_id)
+                doc = proxy.get_document(resource, request.document_id)
             except AppwriteProxyError as exc:
                 print(f"[data.delete_document] outfits preload failed: {exc}")
                 doc = {}
@@ -1300,13 +1448,13 @@ def delete_document(request: DeleteRequest):
                 delete_meta["r2_error"] = str(exc)
                 print(f"[data.delete_document] outfits r2 delete failed: {exc}")
 
-        proxy.delete_document(request.resource, request.document_id)
+        proxy.delete_document(resource, request.document_id)
         response: Dict[str, Any] = {"ok": True}
-        if request.resource == "outfits":
+        if resource == "outfits":
             response["meta"] = delete_meta
         return response
     except AppwriteProxyError as exc:
-        print(f"[data.delete_document] resource={request.resource} document_id={request.document_id} error={exc}")
+        print(f"[data.delete_document] resource={request.resource} normalized={resource} document_id={request.document_id} error={exc}")
         raise _http_error_from_proxy(exc)
 
 

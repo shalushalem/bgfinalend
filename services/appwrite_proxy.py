@@ -66,6 +66,13 @@ class AppwriteProxy:
             "plans": os.getenv("APPWRITE_COLLECTION_PLANS", "") or os.getenv("PLANS_COLLECTION_ID", ""),
             "saved_boards": os.getenv("APPWRITE_COLLECTION_SAVED_BOARDS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_SAVED_BOARDS", ""),
             "skincare": os.getenv("APPWRITE_COLLECTION_SKINCARE", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_SKINCARE", ""),
+            "skincare_profiles": (
+                os.getenv("APPWRITE_COLLECTION_SKINCARE_PROFILES", "")
+                or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_SKINCARE_PROFILES", "")
+                or os.getenv("APPWRITE_COLLECTION_SKINCARE", "")
+                or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_SKINCARE", "")
+            ),
+            "contacts": os.getenv("APPWRITE_COLLECTION_CONTACTS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CONTACTS", ""),
             "workout_outfits": os.getenv("APPWRITE_COLLECTION_WORKOUT_OUTFITS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_WORKOUT_OUTFITS", ""),
             "bills": os.getenv("APPWRITE_COLLECTION_BILLS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_BILLS", ""),
             "coupons": os.getenv("APPWRITE_COLLECTION_COUPONS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_COUPONS", ""),
@@ -74,6 +81,24 @@ class AppwriteProxy:
             "meal_plans": os.getenv("APPWRITE_COLLECTION_MEAL_PLANS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_MEAL_PLANS", ""),
             "life_goals": os.getenv("APPWRITE_COLLECTION_LIFE_GOALS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_LIFE_GOALS", ""),
             "life_boards": os.getenv("APPWRITE_COLLECTION_LIFE_BOARDS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_LIFE_BOARDS", ""),
+            "chat_threads": os.getenv("APPWRITE_COLLECTION_CHAT_THREADS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CHAT_THREADS", ""),
+            "chat_messages": os.getenv("APPWRITE_COLLECTION_CHAT_MESSAGES", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CHAT_MESSAGES", ""),
+        }
+        self.resource_aliases = {
+            # Organize module keys -> Appwrite resource keys
+            "meal_planner": "meal_plans",
+            "meal": "meal_plans",
+            "medicines": "meds",
+            "medicine": "meds",
+            "calendar": "plans",
+            "workout": "workout_outfits",
+            "workouts": "workout_outfits",
+            "skincare": "skincare_profiles",
+            "skin": "skincare_profiles",
+            "skincare_profile": "skincare_profiles",
+            "life_board": "life_boards",
+            "lifeboard": "life_boards",
+            "contacts": "users",
         }
 
         self.user_field_map = {
@@ -82,6 +107,8 @@ class AppwriteProxy:
             "plans": "userId",
             "saved_boards": "userId",
             "skincare": "userId",
+            "skincare_profiles": "userId",
+            "contacts": "userId",
             "workout_outfits": "userId",
             "bills": "userId",
             "coupons": "userId",
@@ -90,6 +117,8 @@ class AppwriteProxy:
             "meal_plans": "userId",
             "life_goals": "userId",
             "life_boards": "userId",
+            "chat_threads": "userId",
+            "chat_messages": "userId",
         }
 
         self.order_query_map = {
@@ -97,6 +126,8 @@ class AppwriteProxy:
             "plans": None,
             "saved_boards": {"method": "orderDesc", "attribute": "$createdAt"},
             "skincare": None,
+            "skincare_profiles": {"method": "orderDesc", "attribute": "$createdAt"},
+            "contacts": {"method": "orderDesc", "attribute": "$createdAt"},
             "workout_outfits": {"method": "orderDesc", "attribute": "$createdAt"},
             "bills": {"method": "orderDesc", "attribute": "$createdAt"},
             "coupons": {"method": "orderDesc", "attribute": "$createdAt"},
@@ -105,7 +136,15 @@ class AppwriteProxy:
             "meal_plans": {"method": "orderDesc", "attribute": "$createdAt"},
             "life_goals": {"method": "orderDesc", "attribute": "$createdAt"},
             "life_boards": {"method": "orderDesc", "attribute": "$createdAt"},
+            "chat_threads": {"method": "orderDesc", "attribute": "$updatedAt"},
+            "chat_messages": {"method": "orderDesc", "attribute": "$createdAt"},
         }
+
+    def _normalize_resource(self, resource: str) -> str:
+        key = str(resource or "").strip()
+        if not key:
+            return key
+        return self.resource_aliases.get(key, key)
 
     @staticmethod
     def _serialize_query_token(token: Any) -> str:
@@ -132,6 +171,7 @@ class AppwriteProxy:
             )
 
     def _collection_id(self, resource: str) -> str:
+        resource = self._normalize_resource(resource)
         collection_id = self.collection_map.get(resource, "")
         if not collection_id:
             env_suffix = resource.upper()
@@ -344,6 +384,7 @@ class AppwriteProxy:
         offset: int = 0,
         return_meta: bool = False,
     ):
+        resource = self._normalize_resource(resource)
         collection_id = self._collection_id(resource)
         user_field = self.user_field_map.get(resource)
         try:
@@ -429,19 +470,23 @@ class AppwriteProxy:
         return payload if return_meta else docs
 
     def get_document(self, resource: str, document_id: str) -> Dict[str, Any]:
+        resource = self._normalize_resource(resource)
         collection_id = self._collection_id(resource)
         return self._request("GET", self._url(collection_id, document_id))
 
     def create_document(self, resource: str, data: Dict[str, Any], document_id: str = "unique()") -> Dict[str, Any]:
+        resource = self._normalize_resource(resource)
         collection_id = self._collection_id(resource)
         payload = {"documentId": document_id, "data": data}
         return self._request("POST", self._url(collection_id), payload=payload)
 
     def update_document(self, resource: str, document_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        resource = self._normalize_resource(resource)
         collection_id = self._collection_id(resource)
         payload = {"data": data}
         return self._request("PATCH", self._url(collection_id, document_id), payload=payload)
 
     def delete_document(self, resource: str, document_id: str) -> None:
+        resource = self._normalize_resource(resource)
         collection_id = self._collection_id(resource)
         self._request("DELETE", self._url(collection_id, document_id))

@@ -363,7 +363,11 @@ def _draw_overlay(image: Image.Image, items: List[Dict[str, Any]]) -> str:
 
 @router.post("/analyze")
 def analyze_capture(request: CaptureAnalyzeRequest):
-    image = _decode_image_base64(request.image_base64)
+    return analyze_capture_core(request.user_id, request.image_base64)
+
+
+def analyze_capture_core(user_id: str, image_base64: str):
+    image = _decode_image_base64(image_base64)
     detections = _detect_multi_items(image)
 
     items: List[Dict[str, Any]] = []
@@ -439,9 +443,39 @@ def _decode_simple_base64(value: str) -> bytes:
 
 @router.post("/save-selected")
 def save_selected(request: SaveSelectedRequest):
-    selected = set(request.selected_item_ids or [])
+    return save_selected_core(
+        user_id=request.user_id,
+        selected_item_ids=request.selected_item_ids,
+        detected_items=request.detected_items,
+    )
+
+
+def _normalize_detected_items(items: List[Any]) -> List[DetectedItem]:
+    normalized: List[DetectedItem] = []
+    for item in items or []:
+        if isinstance(item, DetectedItem):
+            normalized.append(item)
+        elif isinstance(item, dict):
+            normalized.append(DetectedItem(**item))
+        else:
+            if hasattr(item, "model_dump"):
+                normalized.append(DetectedItem(**item.model_dump()))
+            else:
+                normalized.append(DetectedItem(**item.dict()))
+    return normalized
+
+
+def save_selected_core(
+    *,
+    user_id: str,
+    selected_item_ids: List[str],
+    detected_items: List[Any],
+):
+    selected = set(selected_item_ids or [])
     if not selected:
         raise HTTPException(status_code=400, detail="selected_item_ids cannot be empty")
+
+    normalized_items = _normalize_detected_items(detected_items)
 
     storage = R2Storage()
     proxy = AppwriteProxy()
@@ -451,7 +485,7 @@ def save_selected(request: SaveSelectedRequest):
     pixel_max_distance = _pixel_duplicate_distance()
     image_duplicate_threshold = _image_duplicate_threshold()
 
-    for item in request.detected_items:
+    for item in normalized_items:
         if item.item_id not in selected:
             continue
 
@@ -463,7 +497,7 @@ def save_selected(request: SaveSelectedRequest):
         if image_vector:
             image_duplicate = qdrant_service.find_image_duplicate(
                 image_vector,
-                request.user_id,
+                user_id,
                 threshold=image_duplicate_threshold,
             )
             if image_duplicate.get("is_duplicate"):
@@ -480,7 +514,7 @@ def save_selected(request: SaveSelectedRequest):
 
         if pixel_hash:
             pixel_duplicate = qdrant_service.find_pixel_duplicate(
-                request.user_id,
+                user_id,
                 pixel_hash,
                 max_distance=pixel_max_distance,
             )
@@ -505,7 +539,7 @@ def save_selected(request: SaveSelectedRequest):
             "occasions": item.occasions,
         }
         vector = encode_metadata(vector_input)
-        duplicate = qdrant_service.find_duplicate(vector, request.user_id, threshold=duplicate_threshold)
+        duplicate = qdrant_service.find_duplicate(vector, user_id, threshold=duplicate_threshold)
         if duplicate.get("is_duplicate"):
             skipped_duplicates.append(
                 {
@@ -530,7 +564,7 @@ def save_selected(request: SaveSelectedRequest):
             raise HTTPException(status_code=500, detail=f"R2 upload failed: {exc}")
 
         metadata = {
-            "userId": request.user_id,
+            "userId": user_id,
             "name": item.name,
             "category": item.category,
             "sub_category": item.sub_category,
@@ -556,7 +590,7 @@ def save_selected(request: SaveSelectedRequest):
             item_id=file_id,
             vector=vector,
             payload={
-                "userId": request.user_id,
+                "userId": user_id,
                 "category": item.category,
                 "sub_category": item.sub_category,
                 "color_code": item.color_code,
@@ -569,7 +603,7 @@ def save_selected(request: SaveSelectedRequest):
                 point_id=file_id,
                 vector=image_vector,
                 payload={
-                    "userId": request.user_id,
+                    "userId": user_id,
                     "category": item.category,
                     "sub_category": item.sub_category,
                     "color_code": item.color_code,

@@ -2,7 +2,6 @@ import json
 import re
 import base64
 import os
-import asyncio
 import cv2
 import numpy as np
 import requests
@@ -31,10 +30,10 @@ try:
 except Exception:
     vision_analyze_task = None
 try:
-    from routers.bg_remover import BGRemoveRequest, remove_background
+    from routers.bg_remover import BGRemoveRequest, remove_background_sync
 except Exception:
     BGRemoveRequest = None
-    remove_background = None
+    remove_background_sync = None
 
 router = APIRouter()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api").rstrip("/")
@@ -133,11 +132,11 @@ def _input_has_alpha(image_base64: str) -> bool:
 def _remove_bg_first(image_base64: str):
     if _input_has_alpha(image_base64):
         return image_base64, True, "input_already_has_alpha"
-    if BGRemoveRequest is None or remove_background is None:
+    if BGRemoveRequest is None or remove_background_sync is None:
         return image_base64, False, "bg_remover_unavailable"
     try:
         req = BGRemoveRequest(image_base64=image_base64)
-        result = asyncio.run(remove_background(req))
+        result = remove_background_sync(req.image_base64)
         if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
             processed = _to_png_data_uri(result.get("image_base64"))
             bg_removed = bool(result.get("bg_removed", True))
@@ -351,10 +350,14 @@ def get_dominant_color(cv_image, k=3):
 # -------------------------
 @router.post("/analyze-image")
 def analyze_image(request: ImageAnalyzeRequest):
+    return vision_analyze_core(request.image_base64, request.userId)
+
+
+def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
     # -------------------------
     # STEP 0: BG REMOVAL FIRST
     # -------------------------
-    vision_input_base64, bg_removed, bg_fallback_reason = _remove_bg_first(request.image_base64)
+    vision_input_base64, bg_removed, bg_fallback_reason = _remove_bg_first(image_base64)
     print("Vision preprocess BG:", {"bg_removed": bg_removed, "reason": bg_fallback_reason})
 
     # -------------------------
@@ -475,7 +478,7 @@ def analyze_image(request: ImageAnalyzeRequest):
     # STEP 3: FORCE TRUE COLOR
     # -------------------------
     final_data["color_code"] = extracted_color_hex
-    final_data["userId"] = request.userId
+    final_data["userId"] = user_id
 
     # -------------------------
     # STEP 4: EMBEDDING + SIMILARITY CHECK
@@ -484,7 +487,7 @@ def analyze_image(request: ImageAnalyzeRequest):
     similar_items = []
     try:
         vector = encode_metadata(final_data)
-        similar_items = qdrant_service.search_similar(vector, request.userId, limit=5)
+        similar_items = qdrant_service.search_similar(vector, user_id, limit=5)
     except Exception as e:
         print("Qdrant similarity search error:", str(e))
 
@@ -500,7 +503,7 @@ def analyze_image(request: ImageAnalyzeRequest):
         try:
             image_duplicate = qdrant_service.find_image_duplicate(
                 image_vector,
-                request.userId,
+                user_id,
                 threshold=image_duplicate_threshold,
             )
         except Exception as e:
@@ -517,7 +520,7 @@ def analyze_image(request: ImageAnalyzeRequest):
     if pixel_hash:
         try:
             pixel_duplicate = qdrant_service.find_pixel_duplicate(
-                request.userId,
+                user_id,
                 pixel_hash,
                 max_distance=pixel_max_distance,
             )

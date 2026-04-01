@@ -558,17 +558,7 @@ Write a premium stylist response in 3-4 lines:
         return {"active": active, "module": module}
 
     def _build_organize_hub(self, user_id: str, appwrite: AppwriteProxy) -> Dict[str, Any]:
-        module_specs = [
-            ("life_boards", "Life Boards", "life_boards", "/organize/life-boards"),
-            ("meal_planner", "Meal Planner", "meal_plans", "/organize/meal-planner"),
-            ("medicines", "Medicines", "meds", "/organize/medicines"),
-            ("bills", "Bills", "bills", "/organize/bills"),
-            ("calendar", "Calendar", "plans", "/organize/calendar"),
-            ("workout", "Workout", "workout_outfits", "/organize/workout"),
-            ("skincare", "Skincare", "skincare", "/organize/skincare"),
-            ("contacts", "Contacts", "users", "/organize/contacts"),
-            ("life_goals", "Life Goals", "life_goals", "/organize/life-goals"),
-        ]
+        module_specs = self._organize_module_specs()
 
         chips = []
         for module, title, resource, route in module_specs:
@@ -600,6 +590,98 @@ Write a premium stylist response in 3-4 lines:
 
         return {"chips": chips, "suggested_prompts": suggested_prompts}
 
+    def _organize_module_specs(self):
+        return [
+            ("life_boards", "Life Boards", "life_boards", "/organize/life-boards"),
+            ("meal_planner", "Meal Planner", "meal_plans", "/organize/meal-planner"),
+            ("medicines", "Medicines", "meds", "/organize/medicines"),
+            ("bills", "Bills", "bills", "/organize/bills"),
+            ("calendar", "Calendar", "plans", "/organize/calendar"),
+            ("workout", "Workout", "workout_outfits", "/organize/workout"),
+            ("skincare", "Skincare", "skincare_profiles", "/organize/skincare"),
+            ("contacts", "Contacts", "users", "/organize/contacts"),
+            ("life_goals", "Life Goals", "life_goals", "/organize/life-goals"),
+        ]
+
+    def _organize_module_spec(self, module_key: str | None):
+        for module, title, resource, route in self._organize_module_specs():
+            if module == (module_key or ""):
+                return {
+                    "module": module,
+                    "title": title,
+                    "resource": resource,
+                    "route": route,
+                }
+        return {
+            "module": "organize",
+            "title": "Organize",
+            "resource": "",
+            "route": "/organize",
+        }
+
+    def _module_preview_cards(self, appwrite: AppwriteProxy, user_id: str, module_key: str | None):
+        spec = self._organize_module_spec(module_key)
+        resource = str(spec.get("resource") or "")
+        route = str(spec.get("route") or "/organize")
+        title = str(spec.get("title") or "Organize")
+
+        if not resource:
+            return {
+                "cards": [],
+                "count": 0,
+                "route": route,
+                "title": title,
+                "resource": resource,
+            }
+
+        try:
+            # Chat module-open should show full board details for the selected module,
+            # not just a single preview card.
+            docs = appwrite.list_documents(resource, user_id=user_id, limit=50)
+        except Exception:
+            docs = []
+
+        cards = []
+        for index, doc in enumerate(docs):
+            if not isinstance(doc, dict):
+                continue
+            doc_id = str(doc.get("$id") or doc.get("id") or f"{module_key}_{index}")
+            doc_title = (
+                str(doc.get("title") or "").strip()
+                or str(doc.get("name") or "").strip()
+                or str(doc.get("label") or "").strip()
+                or f"{title} Item {index + 1}"
+            )
+            doc_subtitle = (
+                str(doc.get("description") or "").strip()
+                or str(doc.get("status") or "").strip()
+                or str(doc.get("createdAt") or "").strip()
+                or "Tap to view details"
+            )
+            cards.append(
+                {
+                    "id": doc_id,
+                    "title": doc_title,
+                    "kind": "item",
+                    "subtitle": doc_subtitle,
+                    "action": {
+                        "type": "open_module",
+                        "module": spec.get("module"),
+                        "route": route,
+                        "document_id": doc.get("$id") or doc.get("id"),
+                    },
+                }
+            )
+
+        return {
+            "cards": cards,
+            "count": len(docs),
+            "route": route,
+            "title": title,
+            "resource": resource,
+            "documents": docs,
+        }
+
     def _organize_response(
         self,
         request_id: str,
@@ -621,9 +703,58 @@ Write a premium stylist response in 3-4 lines:
 
         focus_card = self._build_organize_focus_card(module_key=module_key)
         message = "Choose what you want to organize."
+
         if module_key:
-            message = f"Opening {focus_card.get('title', 'organize module')}. You can start from this chip."
-            chips = [focus_card] + [c for c in chips if c.get("id") != focus_card.get("id")]
+            module_preview = self._module_preview_cards(
+                appwrite=appwrite,
+                user_id=user_id,
+                module_key=module_key,
+            )
+            module_title = module_preview.get("title") or focus_card.get("title", "organize module")
+            route = module_preview.get("route") or focus_card.get("action", {}).get("route", "/organize")
+            cards = module_preview.get("cards", [])
+            count = int(module_preview.get("count") or 0)
+            message = f"Showing {module_title} details."
+            if count == 0:
+                cards = [
+                    {
+                        "id": f"{module_key}_empty",
+                        "title": module_title,
+                        "kind": "empty",
+                        "subtitle": "No items yet. Tap View More to open this board.",
+                        "action": {
+                            "type": "open_module",
+                            "module": module_key,
+                            "route": route,
+                        },
+                    }
+                ]
+
+            return {
+                "success": True,
+                "request_id": request_id,
+                "meta": {
+                    "intent": "organize_hub",
+                    "domain": "organize",
+                    "module": module_key,
+                },
+                "message": message,
+                "board": "organize",
+                "type": "cards",
+                "cards": cards,
+                "data": {
+                    "module": module_key,
+                    "resource": module_preview.get("resource"),
+                    "count": count,
+                    "module_documents": module_preview.get("documents", []),
+                    "view_more": {
+                        "type": "open_module",
+                        "module": module_key,
+                        "route": route,
+                    },
+                    "action": "open_organize_module",
+                },
+            }
 
         return {
             "success": True,
