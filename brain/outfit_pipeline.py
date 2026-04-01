@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple
 from brain.engines.styling.style_builder import style_engine
 from brain.ml.outfit_ranker import outfit_ranker
 from brain.style_graph_engine import style_graph_engine
+from services.appwrite_proxy import AppwriteProxy
 from services.embedding_service import get_model
 from services.qdrant_service import qdrant_service
 
@@ -39,6 +40,62 @@ def _save_memory(memory: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(_MEMORY_FILE), exist_ok=True)
     with open(_MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=True, indent=2)
+
+
+def _memory_doc_id(user_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(user_id or "anonymous"))
+    return f"outfit_memory_{safe}"[:64]
+
+
+def _default_user_memory() -> Dict[str, Any]:
+    return {
+        "recent_outfits": [],
+        "liked_outfits": [],
+        "disliked_outfits": [],
+    }
+
+
+def _load_user_memory(user_id: str) -> Dict[str, Any]:
+    proxy = AppwriteProxy()
+    try:
+        doc = proxy.get_document("memories", _memory_doc_id(user_id))
+        payload = doc.get("payload") if isinstance(doc, dict) else None
+        if isinstance(payload, str) and payload.strip():
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                user_memory = _default_user_memory()
+                user_memory.update(parsed)
+                return user_memory
+    except Exception:
+        pass
+
+    memory = _load_memory()
+    user = _ensure_user_memory(memory, user_id)
+    return dict(user)
+
+
+def _save_user_memory(user_id: str, user_memory: Dict[str, Any]) -> None:
+    proxy = AppwriteProxy()
+    try:
+        payload = {
+            "userId": str(user_id),
+            "name": "outfit_memory",
+            "payload": json.dumps(user_memory, ensure_ascii=True),
+        }
+        doc_id = _memory_doc_id(user_id)
+        try:
+            proxy.update_document("memories", doc_id, payload)
+        except Exception:
+            proxy.create_document("memories", payload, document_id=doc_id)
+        return
+    except Exception:
+        pass
+
+    memory = _load_memory()
+    user = _ensure_user_memory(memory, user_id)
+    user.clear()
+    user.update(user_memory or {})
+    _save_memory(memory)
 
 
 def _ensure_user_memory(memory: Dict[str, Any], user_id: str) -> Dict[str, Any]:
@@ -516,8 +573,7 @@ def save_feedback(user_id: str, outfit: Dict[str, Any], feedback: str) -> Dict[s
         raise ValueError("feedback must be 'up' or 'down'")
 
     with _MEMORY_LOCK:
-        memory = _load_memory()
-        user_memory = _ensure_user_memory(memory, user_id)
+        user_memory = _load_user_memory(user_id)
         record = deepcopy(outfit)
         record["feedback"] = feedback_value
         record["saved_at"] = _utcnow_iso()
@@ -529,7 +585,7 @@ def save_feedback(user_id: str, outfit: Dict[str, Any], feedback: str) -> Dict[s
             user_memory["disliked_outfits"] = [record] + user_memory.get("disliked_outfits", [])
             user_memory["disliked_outfits"] = user_memory["disliked_outfits"][:100]
 
-        _save_memory(memory)
+        _save_user_memory(user_id, user_memory)
         _index_outfit_vector(user_id=user_id, outfit=record, label=feedback_value)
 
     outfit_ranker.learn_from_feedback(user_id=user_id, features=outfit.get("ml_features", {}), feedback=feedback_value)
@@ -574,8 +630,7 @@ def get_daily_outfits(user: Dict[str, Any]) -> Dict[str, Any]:
     combinations = generate_combinations(wardrobe)
 
     with _MEMORY_LOCK:
-        memory = _load_memory()
-        user_memory = _ensure_user_memory(memory, user_id)
+        user_memory = _load_user_memory(user_id)
 
         scored = [
             score_outfit(combo, merged_context, user_memory, rules, semantic_map)
@@ -587,7 +642,7 @@ def get_daily_outfits(user: Dict[str, Any]) -> Dict[str, Any]:
 
         user_memory["recent_outfits"] = ranked + user_memory.get("recent_outfits", [])
         user_memory["recent_outfits"] = user_memory["recent_outfits"][:30]
-        _save_memory(memory)
+        _save_user_memory(user_id, user_memory)
 
         for outfit in ranked:
             _index_outfit_vector(user_id=user_id, outfit=outfit, label="recent")

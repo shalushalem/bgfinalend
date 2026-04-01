@@ -3,7 +3,7 @@ import re
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, List
-from services import llm_service
+from services import ai_gateway
 from brain.outfit_pipeline import get_daily_outfits
 from brain.personalization.style_dna_engine import style_dna_engine
 from services.appwrite_proxy import AppwriteProxy
@@ -23,6 +23,19 @@ class OutfitPipelineRequest(BaseModel):
     wardrobe: Any = None
     user_profile: Dict[str, Any] = {}
     context: Dict[str, Any] = {}
+
+
+def _parse_llm_json_object(text: str) -> Dict[str, Any]:
+    raw = str(text or "").strip()
+    clean = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
+    try:
+        return json.loads(clean)
+    except Exception:
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(clean[start : end + 1])
 
 
 @router.post("/item-suggestions")
@@ -45,15 +58,13 @@ def get_item_suggestions(request: ItemContextRequest):
     try:
         messages = [{"role": "user", "content": user_prompt}]
         # Using the much faster, cheaper text model
-        response_text = llm_service.chat_completion(
+        response_text = ai_gateway.chat_completion(
             messages,
-            system_instruction,
+            system_instruction=system_instruction,
             model="llama3.1",
         )
         
-        # Safe JSON extraction
-        clean_response = re.sub(r'```json|```', '', response_text).strip()
-        return json.loads(clean_response)
+        return _parse_llm_json_object(response_text)
         
     except Exception as e:
         print(f"Stylist Text Engine Error: {str(e)}")

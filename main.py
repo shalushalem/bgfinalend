@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from typing import Callable
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 import importlib.util
 import os
@@ -13,6 +15,7 @@ import os
 from services.qdrant_service import qdrant_service
 from services.security_limits import check_rate_limit, extract_client_ip
 from services.settings import settings
+from middleware.auth_middleware import get_current_user
 
 
 # -------------------------
@@ -96,7 +99,13 @@ except Exception:
 # SENTRY
 # -------------------------
 _sentry_dsn = os.getenv("SENTRY_DSN")
-if _sentry_dsn and sentry_sdk and FastApiIntegration:
+_sentry_client_ready = False
+if sentry_sdk:
+    try:
+        _sentry_client_ready = bool(getattr(sentry_sdk.Hub.current, "client", None))
+    except Exception:
+        _sentry_client_ready = False
+if _sentry_dsn and sentry_sdk and FastApiIntegration and not _sentry_client_ready:
     sentry_sdk.init(
         dsn=_sentry_dsn,
         traces_sample_rate=1.0,
@@ -113,6 +122,7 @@ app = FastAPI(
 )
 
 print("AHVI Backend Started")
+logger = logging.getLogger("ahvi.main")
 
 class PayloadTooLargeError(Exception):
     pass
@@ -240,7 +250,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print("ERROR:", str(exc))
+    logger.exception("Unhandled error on %s", request.url.path, exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -265,6 +275,22 @@ app.add_middleware(
 )
 
 app.add_middleware(StreamBodyLimitMiddleware, max_bytes=settings.upload_max_bytes)
+
+
+@app.middleware("http")
+async def auth_guard_middleware(request: Request, call_next):
+    if not settings.auth_required:
+        return await call_next(request)
+    path = str(request.url.path or "")
+    if path in {"/", "/health"} or path.startswith("/docs") or path.startswith("/openapi"):
+        return await call_next(request)
+    if path.startswith("/api/tasks/"):
+        return await call_next(request)
+    try:
+        request.state.user = await get_current_user(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -342,16 +368,18 @@ if garment_router:
 # -------------------------
 # BG REMOVE COMPAT ROUTES
 # -------------------------
+class BgCompatRequest(BaseModel):
+    image_base64: str = Field(..., min_length=20)
+
+
 @app.post("/api/background/remove-bg")
 @app.post("/api/remove-bg")
-async def remove_bg_compat(payload: dict):
+async def remove_bg_compat(payload: BgCompatRequest):
     """
     Always expose background-removal endpoint even when optional router gating
     prevents router mounting. This keeps frontend flow stable.
     """
-    image_base64 = (payload or {}).get("image_base64", "")
-    if not image_base64:
-        raise HTTPException(status_code=400, detail="image_base64 is required")
+    image_base64 = payload.image_base64
 
     try:
         from routers.bg_remover import remove_background_sync
@@ -398,12 +426,26 @@ def get_task_status(job_id: str):
     task_result = AsyncResult(job_id, app=celery_app)
 
     if task_result.state == "PENDING":
-        return {"status": "processing"}
+        return {"status": "queued", "state": "PENDING"}
+
+    if task_result.state == "STARTED":
+        return {
+            "status": "processing",
+            "state": "STARTED",
+            "meta": task_result.info if isinstance(task_result.info, dict) else {},
+        }
 
     if task_result.state == "SUCCESS":
-        return {"status": "completed", "result": task_result.result}
+        return {"status": "completed", "state": "SUCCESS", "result": task_result.result}
 
     if task_result.state == "FAILURE":
-        return {"status": "failed", "error": str(task_result.info)}
+        return {"status": "failed", "state": "FAILURE", "error": str(task_result.info)}
 
-    return {"status": task_result.state}
+    if task_result.state == "RETRY":
+        return {
+            "status": "retrying",
+            "state": "RETRY",
+            "error": str(task_result.info),
+        }
+
+    return {"status": "processing", "state": task_result.state}

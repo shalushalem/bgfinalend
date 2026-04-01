@@ -83,6 +83,7 @@ class AppwriteProxy:
             "life_boards": os.getenv("APPWRITE_COLLECTION_LIFE_BOARDS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_LIFE_BOARDS", ""),
             "chat_threads": os.getenv("APPWRITE_COLLECTION_CHAT_THREADS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CHAT_THREADS", ""),
             "chat_messages": os.getenv("APPWRITE_COLLECTION_CHAT_MESSAGES", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CHAT_MESSAGES", ""),
+            "memories": os.getenv("APPWRITE_COLLECTION_MEMORIES", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_MEMORIES", ""),
         }
         self.resource_aliases = {
             # Organize module keys -> Appwrite resource keys
@@ -99,6 +100,7 @@ class AppwriteProxy:
             "life_board": "life_boards",
             "lifeboard": "life_boards",
             "contacts": "users",
+            "memory": "memories",
         }
 
         self.user_field_map = {
@@ -119,6 +121,7 @@ class AppwriteProxy:
             "life_boards": "userId",
             "chat_threads": "userId",
             "chat_messages": "userId",
+            "memories": "userId",
         }
 
         self.order_query_map = {
@@ -138,6 +141,7 @@ class AppwriteProxy:
             "life_boards": {"method": "orderDesc", "attribute": "$createdAt"},
             "chat_threads": {"method": "orderDesc", "attribute": "$updatedAt"},
             "chat_messages": {"method": "orderDesc", "attribute": "$createdAt"},
+            "memories": {"method": "orderDesc", "attribute": "$updatedAt"},
         }
 
     def _normalize_resource(self, resource: str) -> str:

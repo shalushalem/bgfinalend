@@ -4,6 +4,8 @@ from collections import Counter
 from threading import Lock
 from typing import Any, Dict, List
 
+from services.appwrite_proxy import AppwriteProxy
+
 
 class StyleDNAEngine:
     """
@@ -25,7 +27,14 @@ class StyleDNAEngine:
 
         with self._lock:
             dna_state = self._load_json(self._dna_path, fallback={"users": {}})
+            db_dna = self._load_memory_payload("style_dna", user_id)
+            if isinstance(db_dna, dict):
+                dna_state.setdefault("users", {})[user_id] = db_dna
+
             feedback_memory = self._load_json(self._feedback_memory_path, fallback={"users": {}})
+            db_feedback = self._load_memory_payload("outfit_memory", user_id)
+            if isinstance(db_feedback, dict):
+                feedback_memory.setdefault("users", {})[user_id] = db_feedback
 
             learned_dna = self._build_dna(
                 profile=profile,
@@ -36,6 +45,7 @@ class StyleDNAEngine:
 
             dna_state.setdefault("users", {})[user_id] = learned_dna
             self._save_json(self._dna_path, dna_state)
+            self._save_memory_payload("style_dna", user_id, learned_dna)
             return learned_dna
 
     def enrich_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -175,6 +185,41 @@ class StyleDNAEngine:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
+
+    @staticmethod
+    def _memory_doc_id(key: str, user_id: str) -> str:
+        safe_user = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(user_id or "anonymous"))
+        safe_key = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(key or "memory"))
+        return f"{safe_key}_{safe_user}"[:64]
+
+    def _load_memory_payload(self, key: str, user_id: str) -> Dict[str, Any] | None:
+        proxy = AppwriteProxy()
+        try:
+            doc = proxy.get_document("memories", self._memory_doc_id(key, user_id))
+            payload = doc.get("payload") if isinstance(doc, dict) else None
+            if isinstance(payload, str) and payload.strip():
+                parsed = json.loads(payload)
+                if isinstance(parsed, dict):
+                    return parsed
+        except Exception:
+            return None
+        return None
+
+    def _save_memory_payload(self, key: str, user_id: str, payload_obj: Dict[str, Any]) -> None:
+        proxy = AppwriteProxy()
+        doc_id = self._memory_doc_id(key, user_id)
+        payload = {
+            "userId": str(user_id),
+            "name": str(key),
+            "payload": json.dumps(payload_obj, ensure_ascii=True),
+        }
+        try:
+            proxy.update_document("memories", doc_id, payload)
+        except Exception:
+            try:
+                proxy.create_document("memories", payload, document_id=doc_id)
+            except Exception:
+                pass
 
 
 style_dna_engine = StyleDNAEngine()

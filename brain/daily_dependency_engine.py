@@ -8,6 +8,16 @@ from brain.decision_engine import decision_engine
 TIME_SLOTS = ("morning", "midday", "afternoon", "evening", "night")
 
 
+def _normalize_documents(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [doc for doc in payload if isinstance(doc, dict)]
+    if isinstance(payload, dict):
+        docs = payload.get("documents", [])
+        if isinstance(docs, list):
+            return [doc for doc in docs if isinstance(doc, dict)]
+    return []
+
+
 def _time_slot_from_hour(hour: int) -> str:
     if 5 <= hour < 12:
         return "morning"
@@ -49,7 +59,7 @@ def _resolve_persona(user_profile: Dict[str, Any]) -> str:
 
 def _count_resource(appwrite: AppwriteProxy, resource: str, user_id: str) -> int:
     try:
-        docs = appwrite.list_documents(resource, user_id=user_id, limit=50)
+        docs = _normalize_documents(appwrite.list_documents(resource, user_id=user_id, limit=50))
         return len(docs)
     except Exception:
         return 0
@@ -57,7 +67,7 @@ def _count_resource(appwrite: AppwriteProxy, resource: str, user_id: str) -> int
 
 def _first_title(appwrite: AppwriteProxy, resource: str, user_id: str, field: str = "title") -> Optional[str]:
     try:
-        docs = appwrite.list_documents(resource, user_id=user_id, limit=1)
+        docs = _normalize_documents(appwrite.list_documents(resource, user_id=user_id, limit=1))
         if docs:
             value = docs[0].get(field) or docs[0].get("name")
             return str(value) if value else None

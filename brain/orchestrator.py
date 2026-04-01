@@ -16,7 +16,7 @@ from brain.intent_engine import detect_intent
 from brain.daily_dependency_engine import build_daily_dependency_response
 
 from services.appwrite_proxy import AppwriteProxy
-from services.llm_service import generate_text  # 🔥 NEW
+from services.ai_gateway import generate_text
 
 
 def _hash_outfit(outfit):
@@ -119,19 +119,12 @@ class AhviOrchestrator:
             # TRY-ON FLOW
             # -------------------------
             if intent == "try_on":
-                return {
-                    "success": True,
-                    "request_id": request_id,
-                    "meta": {"intent": intent, "domain": "styling"},
-                    "message": "Select an outfit to try on.",
-                    "board": "tryon",
-                    "type": "tryon",
-                    "cards": [],
-                    "data": {
-                        "action": "open_tryon",
-                        "note": "Frontend should pass outfit to try-on API"
-                    },
-                }
+                return self._try_on_response(
+                    request_id=request_id,
+                    user_id=user_id,
+                    appwrite=appwrite,
+                    context=context,
+                )
 
             # -------------------------
             # WARDROBE QUERY FLOW
@@ -436,6 +429,58 @@ class AhviOrchestrator:
             )
         return {}
 
+    def _try_on_response(
+        self,
+        request_id: str,
+        user_id: str,
+        appwrite: AppwriteProxy,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            wardrobe_docs = self._normalize_documents(
+                appwrite.list_documents("outfits", user_id=user_id, limit=100)
+            )
+        except Exception:
+            wardrobe_docs = []
+
+        pipeline = get_daily_outfits(
+            {
+                "user_id": user_id,
+                "wardrobe": wardrobe_docs,
+                "context": context or {},
+            }
+        )
+        cards = pipeline.get("cards", []) if isinstance(pipeline, dict) else []
+        top_card = cards[0] if cards else {}
+        tryon_payload = top_card.get("tryon_payload") if isinstance(top_card, dict) else None
+
+        if not tryon_payload:
+            return {
+                "success": True,
+                "request_id": request_id,
+                "meta": {"intent": "try_on", "domain": "styling"},
+                "message": "I need at least one complete outfit before try-on. Add tops, bottoms, and shoes.",
+                "board": "tryon",
+                "type": "tryon",
+                "cards": [],
+                "data": {"action": "open_tryon", "tryon_payload": None},
+            }
+
+        return {
+            "success": True,
+            "request_id": request_id,
+            "meta": {"intent": "try_on", "domain": "styling"},
+            "message": "Try-on look prepared. Tap to launch virtual try-on.",
+            "board": "tryon",
+            "type": "tryon",
+            "cards": cards[:3],
+            "data": {
+                "action": "open_tryon",
+                "tryon_payload": tryon_payload,
+                "board_item_ids": pipeline.get("board_item_ids", []),
+            },
+        }
+
     def _cache_key(self, text: str, user_id: str, context: Dict[str, Any]) -> str:
         wardrobe = context.get("wardrobe", []) or []
         wardrobe_signature = "|".join(
@@ -448,9 +493,21 @@ class AhviOrchestrator:
         slots = context.get("slots", {}) if isinstance(context.get("slots"), dict) else {}
         slot_signature = "|".join(f"{k}:{slots.get(k)}" for k in sorted(slots.keys()))
         profile = context.get("user_profile", {}) if isinstance(context.get("user_profile"), dict) else {}
-        profile_signature = f"{profile.get('style', '')}|{','.join(profile.get('preferred_colors', profile.get('colors', []))[:5])}"
+        profile_colors = (profile.get("preferred_colors") or profile.get("colors") or [])
+        if not isinstance(profile_colors, list):
+            profile_colors = []
+        profile_signature = f"{profile.get('style', '')}|{','.join([str(c) for c in profile_colors[:5]])}"
         seed = f"{user_id}|{text.strip().lower()}|{wardrobe_signature}|{slot_signature}|{profile_signature}"
         return hashlib.md5(seed.encode()).hexdigest()
+
+    def _normalize_documents(self, payload: Any) -> list[dict]:
+        if isinstance(payload, list):
+            return [doc for doc in payload if isinstance(doc, dict)]
+        if isinstance(payload, dict):
+            docs = payload.get("documents", [])
+            if isinstance(docs, list):
+                return [doc for doc in docs if isinstance(doc, dict)]
+        return []
 
     def _get_cache(self, key: str) -> Dict[str, Any] | None:
         data = self._cache.get(key)
@@ -637,9 +694,11 @@ Write a premium stylist response in 3-4 lines:
         try:
             # Chat module-open should show full board details for the selected module,
             # not just a single preview card.
-            docs = appwrite.list_documents(resource, user_id=user_id, limit=50)
+            docs_raw = appwrite.list_documents(resource, user_id=user_id, limit=50)
         except Exception:
-            docs = []
+            docs_raw = []
+
+        docs = self._normalize_documents(docs_raw)
 
         cards = []
         for index, doc in enumerate(docs):
@@ -802,7 +861,7 @@ Write a premium stylist response in 3-4 lines:
 
     def _count_resource(self, appwrite: AppwriteProxy, resource: str, user_id: str) -> int:
         try:
-            docs = appwrite.list_documents(resource, user_id=user_id, limit=50)
+            docs = self._normalize_documents(appwrite.list_documents(resource, user_id=user_id, limit=50))
             return len(docs)
         except Exception:
             return 0
@@ -825,7 +884,9 @@ Write a premium stylist response in 3-4 lines:
         text: str,
     ) -> Dict[str, Any]:
         try:
-            wardrobe_docs = appwrite.list_documents("outfits", user_id=user_id, limit=100)
+            wardrobe_docs = self._normalize_documents(
+                appwrite.list_documents("outfits", user_id=user_id, limit=100)
+            )
         except Exception:
             wardrobe_docs = []
 

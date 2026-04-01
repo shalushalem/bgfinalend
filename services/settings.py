@@ -15,6 +15,7 @@ class AppSettings(BaseModel):
     rate_limit_max_requests: int = Field(default=120)
     upload_max_bytes: int = Field(default=5 * 1024 * 1024)
     auth_cache_ttl_seconds: int = Field(default=30)
+    auth_required: bool = Field(default=False)
     redis_url: str = Field(default="redis://localhost:6379/0")
 
     @model_validator(mode="after")
@@ -37,9 +38,9 @@ class AppSettings(BaseModel):
             rate_limit_max_requests=int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120")),
             upload_max_bytes=int(os.getenv("UPLOAD_MAX_BYTES", str(5 * 1024 * 1024))),
             auth_cache_ttl_seconds=int(os.getenv("AUTH_CACHE_TTL_SECONDS", "30")),
+            auth_required=_env_bool("AUTH_REQUIRED", False),
             redis_url=str(os.getenv("REDIS_URL", "redis://localhost:6379/0")),
         )
 
 
 settings = AppSettings.from_env()
-

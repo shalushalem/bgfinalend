@@ -101,6 +101,19 @@ def _vision_model_candidates():
     return ordered
 
 
+def _parse_llm_json_object(text: str):
+    raw = str(text or "").strip()
+    clean = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
+    try:
+        return json.loads(clean)
+    except Exception:
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(clean[start : end + 1])
+
+
 class ImageAnalyzeRequest(BaseModel):
     image_base64: str = Field(..., min_length=20)
     userId: str = "demo_user"
@@ -425,8 +438,7 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
                         f"status={response.status_code} body={body[:240]}"
                     )
                 raw_response = response.json().get("response", "{}")
-                clean_response = re.sub(r"```json|```", "", raw_response).strip()
-                final_data = json.loads(clean_response)
+                final_data = _parse_llm_json_object(raw_response)
                 model_used = model_name
                 break
             except Exception as inner_exc:

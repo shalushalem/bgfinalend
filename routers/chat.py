@@ -1,5 +1,5 @@
 ﻿from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any
 import re
 import os
@@ -101,13 +101,21 @@ def _fast_wardrobe_count_response(user_id: str, query_text: str) -> Dict[str, An
 # MODELS
 # -------------------------
 class Message(BaseModel):
-    role: str
-    content: str
+    role: str = Field(..., min_length=1, max_length=24)
+    content: str = Field(..., min_length=1, max_length=4000)
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        role = str(value or "").strip().lower()
+        if role not in {"user", "assistant", "system"}:
+            raise ValueError("role must be one of user/assistant/system")
+        return role
 
 
 class TextChatRequest(BaseModel):
-    messages: List[Message]
-    language: str = "en"
+    messages: List[Message] = Field(..., min_length=1, max_length=30)
+    language: str = Field(default="en", min_length=2, max_length=8)
     current_memory: Any = {}
     user_profile: Dict[str, Any] = {}
     user_id: str | None = None
