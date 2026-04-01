@@ -1,37 +1,28 @@
 from typing import Any, Dict, List
+import logging
 
 from services.ai_gateway import generate_text, parse_json_array
 
 
 class AgentSystem:
     """
-    🔥 Hybrid Planner:
+    Hybrid planner:
     - Uses LLM (Ollama) for dynamic planning
     - Falls back to deterministic rules
     """
 
-    # -------------------------
-    # MAIN ENTRY
-    # -------------------------
     def plan(self, intent: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         try:
             ai_plan = self._llm_plan(intent, context)
-
             if ai_plan:
                 return ai_plan
+        except Exception:
+            logging.exception("LLM planning failed")
 
-        except Exception as e:
-            print("⚠️ LLM planning failed:", str(e))
-
-        # 🔥 fallback (SAFE)
         return self._rule_based_plan(intent)
 
-    # -------------------------
-    # 🧠 LLM PLANNER
-    # -------------------------
     def _llm_plan(self, intent: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt = self._build_prompt(intent, context)
-
         response = generate_text(prompt)
 
         if not response or response == "none":
@@ -39,18 +30,13 @@ class AgentSystem:
 
         try:
             parsed = parse_json_array(str(response))
-
             if isinstance(parsed, list):
                 return parsed
-
         except Exception:
-            print("⚠️ Invalid LLM plan JSON:", response)
+            logging.exception("Invalid LLM plan JSON")
 
         return []
 
-    # -------------------------
-    # 🧾 PROMPT BUILDER
-    # -------------------------
     def _build_prompt(self, intent: str, context: Dict[str, Any]) -> str:
         slots = context.get("slots", {})
 
@@ -86,7 +72,7 @@ Context:
 
 Examples:
 
-daily_outfit →
+daily_outfit ->
 [
   {{"step": "normalize_context", "agent": "context_agent"}},
   {{"step": "build_style_graph", "agent": "style_graph_agent"}},
@@ -94,7 +80,7 @@ daily_outfit →
   {{"step": "persist_and_feedback_hooks", "agent": "memory_agent"}}
 ]
 
-tryon →
+tryon ->
 [
   {{"step": "prepare_tryon", "agent": "tryon_agent"}},
   {{"step": "run_tryon_model", "agent": "vision_agent"}}
@@ -103,9 +89,6 @@ tryon →
 Now generate plan:
 """
 
-    # -------------------------
-    # 🛡️ FALLBACK RULES
-    # -------------------------
     def _rule_based_plan(self, intent: str) -> List[Dict[str, Any]]:
         if intent == "daily_outfit":
             return [

@@ -2,11 +2,11 @@
 
 import json
 import random
-import re
+import logging
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List, Dict, Any
-import requests
+from services.ai_gateway import generate_text, parse_json_object
 
 router = APIRouter()
 
@@ -62,21 +62,15 @@ def generate_outfit(request: StyleRequest):
         }
     })
 
-    payload = {
-        "model": "llama3.1",
-        "prompt": f"{system_prompt}\n\nDATA:\n{user_prompt}",
-        "stream": False,
-        "format": "json"
-    }
-
     try:
-        response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=60)
-        response.raise_for_status()
-        
-        raw_response = response.json().get("response", "{}")
-        # 🚨 FIX JSON CRASHES: Strip out markdown backticks if Ollama outputs them
-        clean_response = re.sub(r"```json|```", "", raw_response).strip()
-        selections = json.loads(clean_response)
+        raw_response = generate_text(
+            prompt=f"{system_prompt}\n\nDATA:\n{user_prompt}",
+            options={"temperature": 0.2, "num_predict": 220},
+            signals={"context_mode": "styling"},
+        )
+        selections = parse_json_object(raw_response) if raw_response else {}
+        if not isinstance(selections, dict):
+            selections = {}
 
         # --- STEP 4: BULLETPROOF STRICT RULE ENFORCEMENT (ID-BASED) ---
         valid_bottom_ids = [str(item.get("id")) for item in available_bottoms]
@@ -124,8 +118,8 @@ def generate_outfit(request: StyleRequest):
             "style_board_tag": style_board_tag
         }
 
-    except Exception as e:
-        print(f"Style Engine Error: {e}")
+    except Exception:
+        logging.exception("Style Engine Error")
         # Absolute Fallback
         fallback_outfit = [masterpiece]
         
