@@ -77,6 +77,16 @@ def _trace(event: str, *, request_id: str, usecase: str, op: str, details: Dict[
     logger.info("ai_gateway %s", payload)
 
 
+def log_control_event(
+    event: str,
+    *,
+    request_id: str = "",
+    usecase: str = "general",
+    details: Dict[str, Any] | None = None,
+) -> None:
+    _trace(event, request_id=str(request_id or ""), usecase=str(usecase or "general"), op="control_plane", details=details)
+
+
 def generate_text(
     prompt: str,
     *,

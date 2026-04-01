@@ -135,7 +135,7 @@ def _fallback_intent(text: str) -> Dict[str, Any]:
     return {"intent": "general", "slots": slots, "confidence": 0.4}
 
 
-def detect_intent(user_text: str, history=None) -> Dict[str, Any]:
+def detect_intent(user_text: str, history=None, model: str | None = None) -> Dict[str, Any]:
     if not user_text:
         return {"intent": "general", "slots": {}, "confidence": 0.0}
 
@@ -145,11 +145,12 @@ def detect_intent(user_text: str, history=None) -> Dict[str, Any]:
         return fallback
 
     prompt = INTENT_PROMPT + user_text
-        response = generate_text(
-            prompt,
-            options={"temperature": 0.2, "num_predict": 200},
-            usecase="intent",
-        )
+    response = generate_text(
+        prompt,
+        options={"temperature": 0.2, "num_predict": 200},
+        usecase="intent",
+        model=model,
+    )
 
     parsed = _safe_parse(response)
 

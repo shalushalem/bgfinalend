@@ -85,7 +85,11 @@ class AhviOrchestrator:
             # -------------------------
             # INTENT ENGINE
             # -------------------------
-            intent_data = detect_intent(text, context.get("history"))
+            intent_data = detect_intent(
+                text,
+                context.get("history"),
+                model=self._runtime_model(context, "intent"),
+            )
             intent = intent_data.get("intent", "general")
 
             if intent == "daily_dependency":
@@ -188,7 +192,9 @@ class AhviOrchestrator:
             general_message = generate_text(
                 text,
                 user_profile=context.get("user_profile"),
-                signals={"context_mode": "general"}
+                signals={"context_mode": "general"},
+                usecase="general",
+                model=self._runtime_model(context, "general"),
             )
             if not general_message or general_message == "none":
                 general_message = "Tell me your occasion, weather, and vibe, and I will style you with your wardrobe."
@@ -559,6 +565,18 @@ class AhviOrchestrator:
             return "energized"
         return "neutral"
 
+    def _runtime_model(self, context: Dict[str, Any], usecase: str) -> str | None:
+        runtime = context.get("ai_runtime", {}) if isinstance(context, dict) else {}
+        if not isinstance(runtime, dict):
+            return None
+        by_usecase = runtime.get("model_by_usecase", {})
+        if isinstance(by_usecase, dict):
+            selected = str(by_usecase.get(usecase) or "").strip()
+            if selected:
+                return selected
+        selected = str(runtime.get("primary_model") or "").strip()
+        return selected or None
+
     def _build_stylist_message(
         self,
         text: str,
@@ -597,6 +615,8 @@ Write a premium stylist response in 3-4 lines:
 """,
                 user_profile=user_profile,
                 signals=signals,
+                usecase="styling",
+                model=self._runtime_model(context, "styling"),
             )
             if model_message and model_message != "none":
                 return model_message
