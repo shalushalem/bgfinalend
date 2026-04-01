@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Request
 
 from brain.orchestrator import ahvi_orchestrator
+from brain.response_validator import validate_orchestrator_response
 from services import ai_gateway
 
 router = APIRouter(prefix="/ai")
@@ -131,6 +132,8 @@ def run_ai(payload: dict, request: Request):
                 user_id=user_id,
                 context=local_context,
             )
+            if isinstance(result, dict):
+                result = validate_orchestrator_response(result, request_id=request_id)
             if isinstance(result, dict) and result.get("success", True):
                 ai_gateway.log_control_event(
                     "tier_success",

@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any
 import re
 import os
+import logging
 
 from deep_translator import GoogleTranslator
 
@@ -24,6 +25,7 @@ from services.task_queue import enqueue_task
 from services.weather_service import get_hourly_weather
 
 router = APIRouter()
+logger = logging.getLogger("ahvi.routers.chat")
 
 
 def _build_history(messages: List["Message"]) -> List[Dict[str, Any]]:
@@ -212,7 +214,7 @@ def text_chat(request: TextChatRequest, http_request: Request):
                 lon=location.get("lon")
             )
     except Exception as e:
-        print("Weather error:", str(e))
+        logger.warning("weather lookup failed user_id=%s error=%s", request.user_id or request.userID or "user_1", e)
 
     # -------------------------
     # ORCHESTRATOR CALL
@@ -330,7 +332,7 @@ def outfit_feedback(request: OutfitFeedbackRequest):
 
 
 @router.post("/organize/chips")
-def organize_chips(request: OrganizeHubRequest):
+def organize_chips(request: OrganizeHubRequest, http_request: Request):
     try:
         result = ahvi_orchestrator.run(
             text="open organize",
@@ -341,6 +343,7 @@ def organize_chips(request: OrganizeHubRequest):
                 "module_context": "organize",
                 "history": [],
                 "include_counts": request.include_counts,
+                "request_id": str(getattr(http_request.state, "request_id", "") or ""),
             },
         )
         return {
@@ -357,7 +360,7 @@ def organize_chips(request: OrganizeHubRequest):
 
 
 @router.post("/plan-pack")
-def plan_pack(request: PlanPackRequest):
+def plan_pack(request: PlanPackRequest, http_request: Request):
     try:
         weather_data = {}
         try:
@@ -378,6 +381,7 @@ def plan_pack(request: PlanPackRequest):
                 "user_profile": request.user_profile,
                 "module_context": "plan_pack",
                 "history": [],
+                "request_id": str(getattr(http_request.state, "request_id", "") or ""),
                 "weather": weather_data.get("condition"),
                 "time_of_day": weather_data.get("time_of_day"),
                 "weather_data": weather_data,
@@ -401,7 +405,7 @@ def plan_pack(request: PlanPackRequest):
 
 @router.post("/daily/cards")
 @router.post("/text/daily/cards")
-def daily_cards(request: DailyCardsRequest):
+def daily_cards(request: DailyCardsRequest, http_request: Request):
     try:
         weather_data = {}
         try:
@@ -425,6 +429,7 @@ def daily_cards(request: DailyCardsRequest):
                 "user_profile": request.user_profile,
                 "module_context": "daily_dependency",
                 "history": [],
+                "request_id": str(getattr(http_request.state, "request_id", "") or ""),
                 "time_slot": slot_hint or None,
                 "weather": weather_data.get("condition"),
                 "time_of_day": weather_data.get("time_of_day"),

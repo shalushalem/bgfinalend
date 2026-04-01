@@ -13,6 +13,8 @@ class AppSettings(BaseModel):
     rate_limit_enabled: bool = Field(default=True)
     rate_limit_window_seconds: int = Field(default=60)
     rate_limit_max_requests: int = Field(default=120)
+    rate_limit_require_redis: bool = Field(default=False)
+    rate_limit_fail_closed: bool = Field(default=False)
     upload_max_bytes: int = Field(default=5 * 1024 * 1024)
     auth_cache_ttl_seconds: int = Field(default=30)
     auth_required: bool = Field(default=False)
@@ -36,6 +38,8 @@ class AppSettings(BaseModel):
             rate_limit_enabled=_env_bool("RATE_LIMIT_ENABLED", True),
             rate_limit_window_seconds=int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
             rate_limit_max_requests=int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120")),
+            rate_limit_require_redis=_env_bool("RATE_LIMIT_REQUIRE_REDIS", False),
+            rate_limit_fail_closed=_env_bool("RATE_LIMIT_FAIL_CLOSED", False),
             upload_max_bytes=int(os.getenv("UPLOAD_MAX_BYTES", str(5 * 1024 * 1024))),
             auth_cache_ttl_seconds=int(os.getenv("AUTH_CACHE_TTL_SECONDS", "30")),
             auth_required=_env_bool("AUTH_REQUIRED", False),

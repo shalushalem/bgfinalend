@@ -20,6 +20,11 @@ async def get_redis_client():
     global _redis_client
     if _redis_client is not None:
         return _redis_client
+
+
+async def is_redis_rate_limit_ready() -> bool:
+    client = await get_redis_client()
+    return client is not None
     if redis_async is None:
         return None
     async with _redis_lock:
@@ -90,4 +95,3 @@ async def check_rate_limit(
         return allowed, remaining
     except Exception:
         return await _check_local_window(bucket_key, max_requests, window_seconds)
-

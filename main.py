@@ -1,6 +1,8 @@
 import asyncio
 import logging
 from typing import Callable
+from uuid import uuid4
+from time import perf_counter
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -13,11 +15,13 @@ import os
 
 # ?? QDRANT SERVICE
 from services.qdrant_service import qdrant_service
-from services.security_limits import check_rate_limit, extract_client_ip
+from services.security_limits import check_rate_limit, extract_client_ip, is_redis_rate_limit_ready
 from services.settings import settings
 from middleware.auth_middleware import get_current_user
 from services.job_tracker import job_tracker
-from services.request_context import set_request_id, new_request_id
+from services.request_context import set_request_id
+
+logger = logging.getLogger("ahvi.main")
 
 
 # -------------------------
@@ -29,13 +33,13 @@ def _has_module(name: str) -> bool:
 
 def _load_optional_router(module_name: str, attr: str = "router"):
     if not _has_module(module_name):
-        print(f"?? Skipping {module_name} (not found)")
+        logger.info("router skipped module=%s reason=not_found", module_name)
         return None
     try:
         module = __import__(module_name, fromlist=[attr])
         return getattr(module, attr)
     except Exception as exc:
-        print(f"? {module_name} failed: {exc}")
+        logger.warning("router load failed module=%s error=%s", module_name, exc)
         return None
 
 
@@ -123,8 +127,7 @@ app = FastAPI(
     version="2.2.0"
 )
 
-print("AHVI Backend Started")
-logger = logging.getLogger("ahvi.main")
+logger.info("AHVI Backend Started")
 
 class PayloadTooLargeError(Exception):
     pass
@@ -204,32 +207,32 @@ class StreamBodyLimitMiddleware:
 # -------------------------
 @app.on_event("startup")
 async def startup_event():
-    print("Starting AHVI services...")
+    logger.info("startup begin")
 
     try:
         await asyncio.to_thread(qdrant_service.init)
     except Exception as e:
-        print("Qdrant startup failed:", str(e))
+        logger.exception("qdrant startup failed: %s", e)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    print("AHVI shutting down...")
+    logger.info("shutdown begin")
     try:
         client = getattr(qdrant_service, "client", None)
         if client is not None and hasattr(client, "close"):
             await asyncio.to_thread(client.close)
     except Exception as e:
-        print("Qdrant shutdown failed:", str(e))
+        logger.exception("qdrant shutdown failed: %s", e)
     try:
         from services import appwrite_service  # local import to avoid circulars
         appwrite_client = getattr(appwrite_service, "client", None)
         if appwrite_client is not None and hasattr(appwrite_client, "close"):
             await asyncio.to_thread(appwrite_client.close)
         else:
-            print("Appwrite shutdown skip: client.close() unavailable")
+            logger.info("appwrite shutdown skip: client.close() unavailable")
     except Exception as e:
-        print("Appwrite shutdown skip:", str(e))
+        logger.warning("appwrite shutdown skip error=%s", e)
 
 
 # -------------------------
@@ -286,11 +289,29 @@ app.add_middleware(StreamBodyLimitMiddleware, max_bytes=settings.upload_max_byte
 @app.middleware("http")
 async def request_tracing_middleware(request: Request, call_next):
     incoming = request.headers.get("X-Request-ID")
-    request_id = set_request_id(incoming if incoming else new_request_id())
+    request_id = str(incoming or "").strip() or str(uuid4())
+    set_request_id(request_id)
     request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+    started = perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = int(getattr(response, "status_code", 500))
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.exception("request failed request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+        raise
+    finally:
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        logger.info(
+            "request request_id=%s method=%s path=%s status=%s latency_ms=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            status_code,
+            elapsed_ms,
+        )
 
 
 @app.middleware("http")
@@ -315,6 +336,21 @@ async def rate_limit_middleware(request: Request, call_next):
         return await call_next(request)
     if str(request.method or "").upper() == "OPTIONS":
         return await call_next(request)
+    redis_ready = await is_redis_rate_limit_ready()
+    if settings.rate_limit_require_redis and not redis_ready:
+        status_code = 429 if settings.rate_limit_fail_closed else 503
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "success": False,
+                "request_id": str(getattr(request.state, "request_id", "") or ""),
+                "error": {
+                    "code": "RATE_LIMIT_BACKEND_UNAVAILABLE",
+                    "message": "Rate-limit backend unavailable",
+                },
+            },
+            headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+        )
     request_id = str(getattr(request.state, "request_id", "") or "")
     ip = extract_client_ip(request.headers, request.client.host if request.client else None)
     user_id = ""
@@ -341,6 +377,7 @@ async def rate_limit_middleware(request: Request, call_next):
                 "X-RateLimit-Remaining": str(remaining),
                 "X-RateLimit-Limit": str(settings.rate_limit_max_requests),
                 "X-RateLimit-Window": str(settings.rate_limit_window_seconds),
+                "X-RateLimit-Backend": "redis" if redis_ready else "local",
                 "Retry-After": str(settings.rate_limit_window_seconds),
             },
         )
@@ -348,6 +385,7 @@ async def rate_limit_middleware(request: Request, call_next):
     response.headers["X-RateLimit-Remaining"] = str(remaining)
     response.headers["X-RateLimit-Limit"] = str(settings.rate_limit_max_requests)
     response.headers["X-RateLimit-Window"] = str(settings.rate_limit_window_seconds)
+    response.headers["X-RateLimit-Backend"] = "redis" if redis_ready else "local"
     return response
 
 
@@ -421,15 +459,21 @@ def remove_bg_compat(payload: BgCompatRequest):
             detail=f"BG remover unavailable: {exc}",
         )
 
-    result = remove_background_sync(image_base64)
+    try:
+        result = remove_background_sync(image_base64)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Background removal failed: {exc}",
+        )
     if not isinstance(result, dict) or result.get("bg_removed") is not True:
         fallback = result.get("fallback_reason") if isinstance(result, dict) else "Background removal failed"
         raise HTTPException(
             status_code=503,
             detail=fallback or "Background removal failed",
         )
-    print(
-        "BG compat result:",
+    logger.info(
+        "bg compat result %s",
         {
             "bg_removed": result.get("bg_removed"),
             "fallback_reason": result.get("fallback_reason"),

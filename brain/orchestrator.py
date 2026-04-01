@@ -3,6 +3,8 @@
 import traceback
 import uuid
 import hashlib
+import logging
+import json
 from time import perf_counter
 from typing import Any, Dict
 
@@ -14,13 +16,19 @@ from brain.plan_pack_flow import build_plan_pack_response
 from brain.personalization.style_dna_engine import style_dna_engine
 from brain.intent_engine import detect_intent
 from brain.daily_dependency_engine import build_daily_dependency_response
+from brain.response_validator import to_plain_text, validate_orchestrator_response
 
 from services.appwrite_proxy import AppwriteProxy
 from services.ai_gateway import generate_text
 
+logger = logging.getLogger("ahvi.orchestrator")
 
 def _hash_outfit(outfit):
-    return hashlib.md5(str(outfit).encode()).hexdigest()
+    try:
+        canonical = json.dumps(outfit, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        canonical = str(outfit)
+    return hashlib.md5(canonical.encode("utf-8")).hexdigest()
 
 
 def _safe_log(text: str) -> None:
@@ -43,6 +51,7 @@ class AhviOrchestrator:
         user_id = user_id or "anonymous"
         request_id = str(context.get("request_id") or uuid.uuid4())
         started_at = perf_counter()
+        logger.info("orchestrator.start request_id=%s user_id=%s", request_id, user_id)
 
         appwrite = AppwriteProxy()
 
@@ -50,17 +59,20 @@ class AhviOrchestrator:
             # Fast-path organize entry for chat-open UX.
             early_organize = self._resolve_organize_request(text=text, context=context, slots={}, intent="general")
             if early_organize.get("active") and ("organize" in str(text or "").lower() or "organize" in str(context.get("module_context") or "").lower()):
-                return self._organize_response(
+                return self._finalize_response(
+                    self._organize_response(
+                        request_id=request_id,
+                        user_id=user_id,
+                        appwrite=appwrite,
+                        module_key=early_organize.get("module"),
+                        include_counts=bool(context.get("include_counts", False)),
+                    ),
                     request_id=request_id,
-                    user_id=user_id,
-                    appwrite=appwrite,
-                    module_key=early_organize.get("module"),
-                    include_counts=bool(context.get("include_counts", False)),
                 )
 
             if self._is_plan_pack_request(text=text, context=context):
                 pp = build_plan_pack_response(text=text, context=context)
-                return {
+                return self._finalize_response({
                     "success": True,
                     "request_id": request_id,
                     "meta": {"intent": "plan_pack", "domain": "planning"},
@@ -69,10 +81,10 @@ class AhviOrchestrator:
                     "type": pp.get("type", "checklists"),
                     "cards": pp.get("cards", []),
                     "data": pp.get("data", {}),
-                }
+                }, request_id=request_id)
 
             if self._is_daily_dependency_request(text=text, context=context):
-                return {
+                return self._finalize_response({
                     "success": True,
                     "request_id": request_id,
                     **build_daily_dependency_response(
@@ -80,7 +92,7 @@ class AhviOrchestrator:
                         context=context,
                         appwrite=appwrite,
                     ),
-                }
+                }, request_id=request_id)
 
             # -------------------------
             # INTENT ENGINE
@@ -93,7 +105,7 @@ class AhviOrchestrator:
             intent = intent_data.get("intent", "general")
 
             if intent == "daily_dependency":
-                return {
+                return self._finalize_response({
                     "success": True,
                     "request_id": request_id,
                     **build_daily_dependency_response(
@@ -101,7 +113,7 @@ class AhviOrchestrator:
                         context={**context, "time_slot": (intent_data.get("slots", {}) or {}).get("time")},
                         appwrite=appwrite,
                     ),
-                }
+                }, request_id=request_id)
 
             # -------------------------
             # SLOT MERGE
@@ -123,22 +135,28 @@ class AhviOrchestrator:
             # TRY-ON FLOW
             # -------------------------
             if intent == "try_on":
-                return self._try_on_response(
+                return self._finalize_response(
+                    self._try_on_response(
+                        request_id=request_id,
+                        user_id=user_id,
+                        appwrite=appwrite,
+                        context=context,
+                    ),
                     request_id=request_id,
-                    user_id=user_id,
-                    appwrite=appwrite,
-                    context=context,
                 )
 
             # -------------------------
             # WARDROBE QUERY FLOW
             # -------------------------
             if intent == "wardrobe_query" or self._is_wardrobe_count_query(text):
-                return self._wardrobe_query_response(
+                return self._finalize_response(
+                    self._wardrobe_query_response(
+                        request_id=request_id,
+                        user_id=user_id,
+                        appwrite=appwrite,
+                        text=text,
+                    ),
                     request_id=request_id,
-                    user_id=user_id,
-                    appwrite=appwrite,
-                    text=text,
                 )
 
             # -------------------------
@@ -146,7 +164,7 @@ class AhviOrchestrator:
             # -------------------------
             if intent == "plan_pack" or self._is_plan_pack_request(text=text, context=context):
                 pp = build_plan_pack_response(text=text, context=context)
-                return {
+                return self._finalize_response({
                     "success": True,
                     "request_id": request_id,
                     "meta": {"intent": "plan_pack", "domain": "planning"},
@@ -155,35 +173,41 @@ class AhviOrchestrator:
                     "type": pp.get("type", "checklists"),
                     "cards": pp.get("cards", []),
                     "data": pp.get("data", {}),
-                }
+                }, request_id=request_id)
 
             # -------------------------
             # ORGANIZE HUB FLOW
             # -------------------------
             organize_signal = self._resolve_organize_request(text=text, context=context, slots=slots, intent=intent)
             if organize_signal.get("active"):
-                return self._organize_response(
+                return self._finalize_response(
+                    self._organize_response(
+                        request_id=request_id,
+                        user_id=user_id,
+                        appwrite=appwrite,
+                        module_key=organize_signal.get("module"),
+                        include_counts=bool(context.get("include_counts", False)),
+                    ),
                     request_id=request_id,
-                    user_id=user_id,
-                    appwrite=appwrite,
-                    module_key=organize_signal.get("module"),
-                    include_counts=bool(context.get("include_counts", False)),
                 )
 
             # -------------------------
             # STYLING FLOWS
             # -------------------------
             if intent in ("daily_outfit", "occasion_outfit", "explore_styles"):
-                return self._styling_response(
+                return self._finalize_response(
+                    self._styling_response(
+                        request_id=request_id,
+                        user_id=user_id,
+                        text=text,
+                        context=context,
+                        intent=intent,
+                        intent_data=intent_data,
+                        appwrite=appwrite,
+                        signals=signals,
+                        started_at=started_at,
+                    ),
                     request_id=request_id,
-                    user_id=user_id,
-                    text=text,
-                    context=context,
-                    intent=intent,
-                    intent_data=intent_data,
-                    appwrite=appwrite,
-                    signals=signals,
-                    started_at=started_at,
                 )
 
             # -------------------------
@@ -199,7 +223,7 @@ class AhviOrchestrator:
             if not general_message or general_message == "none":
                 general_message = "Tell me your occasion, weather, and vibe, and I will style you with your wardrobe."
 
-            return {
+            return self._finalize_response({
                 "success": True,
                 "request_id": request_id,
                 "meta": {"intent": intent, "domain": "general"},
@@ -208,11 +232,12 @@ class AhviOrchestrator:
                 "type": "text",
                 "cards": [],
                 "data": {"intent": intent},
-            }
+            }, request_id=request_id)
 
         except Exception:
+            logger.exception("orchestrator.error request_id=%s", request_id)
             _safe_log("ERROR: Orchestrator error\n" + traceback.format_exc())
-            return {
+            return self._finalize_response({
                 "success": False,
                 "request_id": request_id,
                 "error": {
@@ -220,7 +245,10 @@ class AhviOrchestrator:
                     "message": "Something went wrong",
                     "details": request_id,
                 },
-            }
+            }, request_id=request_id)
+
+    def _finalize_response(self, payload: Dict[str, Any], *, request_id: str) -> Dict[str, Any]:
+        return validate_orchestrator_response(payload, request_id=request_id)
 
     # -------------------------
     # HELPERS (UNCHANGED)
@@ -242,7 +270,7 @@ class AhviOrchestrator:
             wardrobe_docs = appwrite.list_documents("outfits", user_id=user_id)
             context["wardrobe"] = wardrobe_docs
         except Exception as e:
-            print("ERROR fetching wardrobe:", str(e))
+            logger.warning("orchestrator.wardrobe_fetch_failed request_id=%s error=%s", request_id, e)
             context["wardrobe"] = []
 
         enriched_context = context_engine.build_context(
@@ -279,11 +307,22 @@ class AhviOrchestrator:
         boards = pipeline_result.get("boards", [])
         cards_from_pipeline = pipeline_result.get("cards", [])
 
-        saved_outfit_ids = self._persist_outfits(
-            appwrite=appwrite,
-            user_id=user_id,
-            outfits=outfits,
-        )
+        fallback_depth = self._fallback_depth(context)
+        if fallback_depth > 0:
+            logger.info(
+                "orchestrator.skip_persist_on_fallback request_id=%s depth=%s outfits=%s",
+                request_id,
+                fallback_depth,
+                len(outfits),
+            )
+            saved_outfit_ids = []
+        else:
+            saved_outfit_ids = self._persist_outfits(
+                appwrite=appwrite,
+                user_id=user_id,
+                outfits=outfits,
+                request_id=request_id,
+            )
 
         cards = cards_from_pipeline if cards_from_pipeline else boards if boards else [
             {
@@ -293,6 +332,15 @@ class AhviOrchestrator:
             }
             for i, oid in enumerate(saved_outfit_ids[:3])
         ]
+        if not cards and outfits:
+            cards = [
+                {
+                    "title": f"Outfit {i+1}",
+                    "outfit_id": f"preview-{_hash_outfit(outfit)[:10]}",
+                    "preview": outfit,
+                }
+                for i, outfit in enumerate(outfits[:3])
+            ]
 
         if outfits:
             message = self._build_stylist_message(
@@ -387,13 +435,13 @@ class AhviOrchestrator:
         )
         return exec_result, state.get("pipeline_result", {})
 
-    def _persist_outfits(self, *, appwrite: AppwriteProxy, user_id: str, outfits: list) -> list[str]:
+    def _persist_outfits(self, *, appwrite: AppwriteProxy, user_id: str, outfits: list, request_id: str = "") -> list[str]:
         saved_outfit_ids: list[str] = []
         try:
-            existing_outfits = appwrite.list_documents("outfits", user_id=user_id)
+            existing_outfits = self._safe_documents(appwrite.list_documents("outfits", user_id=user_id))
             existing_hashes = {_hash_outfit(o) for o in existing_outfits}
         except Exception as e:
-            print("ERROR loading existing outfits:", str(e))
+            logger.warning("orchestrator.outfits_load_failed request_id=%s error=%s", request_id, e)
             existing_hashes = set()
 
         for outfit in outfits:
@@ -406,8 +454,9 @@ class AhviOrchestrator:
                     {"userId": user_id, "hash": outfit_hash, **outfit},
                 )
                 saved_outfit_ids.append(doc.get("$id"))
+                existing_hashes.add(outfit_hash)
             except Exception as e:
-                print("ERROR saving outfit:", str(e))
+                logger.warning("orchestrator.outfit_save_failed request_id=%s error=%s", request_id, e)
         return saved_outfit_ids
 
     def _extract_slots(self, text: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -577,6 +626,15 @@ class AhviOrchestrator:
         selected = str(runtime.get("primary_model") or "").strip()
         return selected or None
 
+    def _fallback_depth(self, context: Dict[str, Any]) -> int:
+        runtime = context.get("ai_runtime", {}) if isinstance(context, dict) else {}
+        if not isinstance(runtime, dict):
+            return 0
+        try:
+            return max(0, int(runtime.get("fallback_depth", 0)))
+        except Exception:
+            return 0
+
     def _build_stylist_message(
         self,
         text: str,
@@ -619,10 +677,10 @@ Write a premium stylist response in 3-4 lines:
                 model=self._runtime_model(context, "styling"),
             )
             if model_message and model_message != "none":
-                return model_message
+                return to_plain_text(model_message, fallback=deterministic)
         except Exception:
             pass
-        return deterministic
+        return to_plain_text(deterministic, fallback="I can help with styling.")
 
     def _resolve_organize_request(
         self,

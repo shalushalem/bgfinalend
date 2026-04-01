@@ -1,7 +1,10 @@
 from typing import Any, Dict, Iterable
+import logging
 
 from services.job_tracker import job_tracker
 from services.request_context import get_request_id
+
+logger = logging.getLogger("ahvi.task_queue")
 
 
 def enqueue_task(
@@ -22,6 +25,14 @@ def enqueue_task(
         safe_kwargs["request_id"] = rid
 
     task = task_func.delay(*safe_args, **safe_kwargs)
+    logger.info(
+        "task_enqueued request_id=%s task_id=%s kind=%s user_id=%s source=%s",
+        rid,
+        task.id,
+        kind,
+        str(user_id or ""),
+        source,
+    )
 
     job_tracker.create(
         job_id=task.id,
@@ -32,4 +43,3 @@ def enqueue_task(
         meta=meta or {},
     )
     return str(task.id)
-
