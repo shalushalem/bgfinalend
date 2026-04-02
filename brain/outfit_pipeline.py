@@ -18,6 +18,11 @@ _MEMORY_LOCK = Lock()
 _MEMORY_FILE = os.path.join(os.path.dirname(__file__), "data", "outfit_memory.json")
 
 
+def _contains_word(text: str, words: List[str]) -> bool:
+    text = f" {str(text or '').lower()} "
+    return any(f" {w} " in text for w in words)
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -139,15 +144,32 @@ def _normalize_wardrobe(raw_wardrobe: Any) -> Dict[str, List[Dict[str, Any]]]:
     }
 
     def _add(raw: Dict[str, Any]) -> None:
-        category = str(raw.get("type") or raw.get("category") or raw.get("main_category") or "").lower()
-        if any(k in category for k in ("outer", "jacket", "blazer", "coat", "hoodie")):
-            parts["outerwear"].append(_normalize_item(raw, "outerwear"))
-        elif any(k in category for k in ("top", "shirt", "tee", "blouse", "sweater")):
-            parts["tops"].append(_normalize_item(raw, "top"))
-        elif any(k in category for k in ("bottom", "jean", "pant", "trouser", "skirt", "short")):
-            parts["bottoms"].append(_normalize_item(raw, "bottom"))
-        elif any(k in category for k in ("shoe", "footwear", "sneaker", "heel", "boot", "sandal")):
+        category = str(
+            raw.get("type")
+            or raw.get("category")
+            or raw.get("main_category")
+            or ""
+        ).lower()
+
+        name = str(raw.get("name", "")).lower()
+
+        # HARD OVERRIDE (MOST IMPORTANT)
+        if any(x in name for x in ["shoe", "sneaker", "boot", "heel", "sandal"]):
             parts["shoes"].append(_normalize_item(raw, "shoes"))
+            return
+
+        # PRIORITY ORDER FIX (FOOTWEAR FIRST)
+        if _contains_word(category, ["shoe", "footwear", "sneaker", "heel", "boot", "sandal"]):
+            parts["shoes"].append(_normalize_item(raw, "shoes"))
+
+        elif _contains_word(category, ["bottom", "jean", "pant", "trouser", "skirt", "short"]):
+            parts["bottoms"].append(_normalize_item(raw, "bottom"))
+
+        elif _contains_word(category, ["outer", "jacket", "blazer", "coat", "hoodie"]):
+            parts["outerwear"].append(_normalize_item(raw, "outerwear"))
+
+        elif _contains_word(category, ["top", "shirt", "tee", "blouse", "sweater"]):
+            parts["tops"].append(_normalize_item(raw, "top"))
 
     if isinstance(raw_wardrobe, dict):
         for item in raw_wardrobe.get("tops", []) or []:
@@ -267,14 +289,20 @@ def _merge_wardrobe(
         item_id = str(item.get("id", ""))
         if not item_id or item_id in seen:
             continue
-        if any(k in item_type for k in ("outer", "jacket", "coat", "blazer", "hoodie")):
-            merged["outerwear"].append(item)
-        elif any(k in item_type for k in ("top", "shirt", "tee", "blouse", "sweater")):
-            merged["tops"].append(item)
-        elif any(k in item_type for k in ("bottom", "pant", "trouser", "jean", "skirt", "short")):
-            merged["bottoms"].append(item)
-        elif any(k in item_type for k in ("shoe", "boot", "heel", "sneaker", "sandal")):
+
+        # PRIORITY ORDER FIX
+        if _contains_word(item_type, ["shoe", "footwear", "sneaker", "boot", "heel", "sandal"]):
             merged["shoes"].append(item)
+
+        elif _contains_word(item_type, ["bottom", "pant", "trouser", "jean", "skirt", "short"]):
+            merged["bottoms"].append(item)
+
+        elif _contains_word(item_type, ["outer", "jacket", "coat", "blazer", "hoodie"]):
+            merged["outerwear"].append(item)
+
+        elif _contains_word(item_type, ["top", "shirt", "tee", "blouse", "sweater"]):
+            merged["tops"].append(item)
+
         seen.add(item_id)
 
     return merged
