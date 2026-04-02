@@ -5,6 +5,7 @@ import uuid
 import hashlib
 import logging
 import json
+from datetime import datetime
 from time import perf_counter
 from typing import Any, Dict
 
@@ -20,6 +21,7 @@ from brain.response_validator import to_plain_text, validate_orchestrator_respon
 
 from services.appwrite_proxy import AppwriteProxy
 from services.ai_gateway import generate_text
+from services.settings import settings
 
 logger = logging.getLogger("ahvi.orchestrator")
 
@@ -548,10 +550,39 @@ class AhviOrchestrator:
                 "data": {"action": "open_tryon", "tryon_payload": None},
             }
 
+        allowed, remaining, used, limit = self._consume_tryon_quota(
+            appwrite=appwrite,
+            user_id=user_id,
+            request_id=request_id,
+        )
+        if not allowed:
+            return {
+                "success": False,
+                "request_id": request_id,
+                "meta": {
+                    "intent": "try_on",
+                    "domain": "styling",
+                    "try_on_daily_limit": limit,
+                    "try_on_used_today": used,
+                    "try_on_remaining": remaining,
+                },
+                "message": "Daily try-on limit reached. You can use try-on again tomorrow.",
+                "board": "tryon",
+                "type": "tryon",
+                "cards": [],
+                "data": {"action": "open_tryon", "tryon_payload": None},
+            }
+
         return {
             "success": True,
             "request_id": request_id,
-            "meta": {"intent": "try_on", "domain": "styling"},
+            "meta": {
+                "intent": "try_on",
+                "domain": "styling",
+                "try_on_daily_limit": limit,
+                "try_on_used_today": used,
+                "try_on_remaining": remaining,
+            },
             "message": "Try-on look prepared. Tap to launch virtual try-on.",
             "board": "tryon",
             "type": "tryon",
@@ -562,6 +593,53 @@ class AhviOrchestrator:
                 "board_item_ids": pipeline.get("board_item_ids", []),
             },
         }
+
+    def _consume_tryon_quota(
+        self,
+        *,
+        appwrite: AppwriteProxy,
+        user_id: str,
+        request_id: str,
+    ) -> tuple[bool, int, int, int]:
+        limit = max(1, int(getattr(settings, "try_on_daily_limit", 2) or 2))
+        today = datetime.now().astimezone().date().isoformat()
+        used = 0
+        try:
+            rows = self._normalize_documents(appwrite.list_documents("jobs", user_id=user_id, limit=300))
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("type") or "").strip().lower() != "try_on":
+                    continue
+                created_at = str(row.get("$createdAt") or row.get("createdAt") or "")
+                if created_at[:10] == today:
+                    used += 1
+        except Exception as exc:
+            logger.warning("orchestrator.tryon_quota_read_failed request_id=%s error=%s", request_id, exc)
+
+        if used >= limit:
+            return False, 0, used, limit
+
+        try:
+            appwrite.create_document(
+                "jobs",
+                {
+                    "userId": str(user_id),
+                    "type": "try_on",
+                    "status": "completed",
+                    "input": "try_on",
+                    "output": "prepared",
+                    "error": "",
+                    "retry_count": 0,
+                    "duration_ms": 0,
+                    "request_id": str(request_id),
+                },
+            )
+        except Exception as exc:
+            logger.warning("orchestrator.tryon_quota_write_failed request_id=%s error=%s", request_id, exc)
+
+        used_after = used + 1
+        return True, max(0, limit - used_after), used_after, limit
 
     def _cache_key(self, text: str, user_id: str, context: Dict[str, Any]) -> str:
         wardrobe = context.get("wardrobe", []) or []

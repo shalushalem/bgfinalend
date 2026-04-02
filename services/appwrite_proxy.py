@@ -84,6 +84,7 @@ class AppwriteProxy:
             "chat_threads": os.getenv("APPWRITE_COLLECTION_CHAT_THREADS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CHAT_THREADS", ""),
             "chat_messages": os.getenv("APPWRITE_COLLECTION_CHAT_MESSAGES", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_CHAT_MESSAGES", ""),
             "memories": os.getenv("APPWRITE_COLLECTION_MEMORIES", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_MEMORIES", ""),
+            "jobs": os.getenv("APPWRITE_COLLECTION_JOBS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_JOBS", ""),
         }
         self.resource_aliases = {
             # Organize module keys -> Appwrite resource keys
@@ -122,6 +123,7 @@ class AppwriteProxy:
             "chat_threads": "userId",
             "chat_messages": "userId",
             "memories": "userId",
+            "jobs": "userId",
         }
 
         self.order_query_map = {
@@ -142,6 +144,7 @@ class AppwriteProxy:
             "chat_threads": {"method": "orderDesc", "attribute": "$updatedAt"},
             "chat_messages": {"method": "orderDesc", "attribute": "$createdAt"},
             "memories": {"method": "orderDesc", "attribute": "$updatedAt"},
+            "jobs": {"method": "orderDesc", "attribute": "$createdAt"},
         }
 
     def _normalize_resource(self, resource: str) -> str:

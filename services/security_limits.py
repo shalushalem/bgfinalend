@@ -20,11 +20,6 @@ async def get_redis_client():
     global _redis_client
     if _redis_client is not None:
         return _redis_client
-
-
-async def is_redis_rate_limit_ready() -> bool:
-    client = await get_redis_client()
-    return client is not None
     if redis_async is None:
         return None
     async with _redis_lock:
@@ -40,6 +35,11 @@ async def is_redis_rate_limit_ready() -> bool:
         except Exception:
             _redis_client = None
         return _redis_client
+
+
+async def is_redis_rate_limit_ready() -> bool:
+    client = await get_redis_client()
+    return client is not None
 
 
 def extract_client_ip(headers, client_host: str | None) -> str:

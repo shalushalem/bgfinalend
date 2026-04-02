@@ -15,6 +15,7 @@ class AppSettings(BaseModel):
     rate_limit_max_requests: int = Field(default=120)
     rate_limit_require_redis: bool = Field(default=False)
     rate_limit_fail_closed: bool = Field(default=False)
+    try_on_daily_limit: int = Field(default=2)
     upload_max_bytes: int = Field(default=5 * 1024 * 1024)
     auth_cache_ttl_seconds: int = Field(default=30)
     auth_required: bool = Field(default=False)
@@ -30,6 +31,8 @@ class AppSettings(BaseModel):
             self.upload_max_bytes = 5 * 1024 * 1024
         if self.auth_cache_ttl_seconds <= 0:
             self.auth_cache_ttl_seconds = 30
+        if self.try_on_daily_limit <= 0:
+            self.try_on_daily_limit = 2
         return self
 
     @classmethod
@@ -40,6 +43,7 @@ class AppSettings(BaseModel):
             rate_limit_max_requests=int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120")),
             rate_limit_require_redis=_env_bool("RATE_LIMIT_REQUIRE_REDIS", False),
             rate_limit_fail_closed=_env_bool("RATE_LIMIT_FAIL_CLOSED", False),
+            try_on_daily_limit=int(os.getenv("TRY_ON_DAILY_LIMIT", "2")),
             upload_max_bytes=int(os.getenv("UPLOAD_MAX_BYTES", str(5 * 1024 * 1024))),
             auth_cache_ttl_seconds=int(os.getenv("AUTH_CACHE_TTL_SECONDS", "30")),
             auth_required=_env_bool("AUTH_REQUIRED", False),
