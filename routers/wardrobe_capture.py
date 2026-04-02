@@ -2,6 +2,7 @@ import base64
 import io
 import uuid
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 
 from services.wardrobe_persistence_service import persist_selected_items
+from services import ai_gateway
 try:
     from worker import capture_analyze_task, capture_save_selected_task, process_upload_task
 except Exception:
@@ -23,66 +25,33 @@ except Exception:
     job_tracker = None
 from services.task_queue import enqueue_task
 
-try:
-    from transformers import pipeline
-except Exception:
-    pipeline = None
-
 
 router = APIRouter(prefix="/api/wardrobe/capture", tags=["wardrobe-capture"])
 
-_detector = None
-_classifier = None
-
-DETECTION_LABELS = [
-    "shirt",
-    "t-shirt",
-    "blouse",
-    "top",
-    "jacket",
-    "blazer",
-    "dress",
-    "skirt",
-    "pants",
-    "trousers",
-    "jeans",
-    "shorts",
-    "shoes",
-    "sneakers",
-    "heels",
-    "boots",
-    "sandals",
-    "watch",
-    "bag",
-    "handbag",
-    "jewelry",
-    "necklace",
-    "earrings",
-    "accessory",
-]
-
-CLASSIFICATION_LABELS = [
-    "formal shirt",
-    "casual shirt",
-    "t-shirt",
-    "blouse",
-    "crop top",
-    "jacket",
-    "blazer",
-    "dress",
-    "skirt",
-    "jeans",
-    "trousers",
-    "shorts",
-    "sneakers",
-    "formal shoes",
-    "heels",
-    "boots",
-    "sandals",
-    "watch",
-    "handbag",
-    "jewelry",
-]
+LLM_CAPTURE_PROMPT = """
+You are a wardrobe parser.
+Analyze the image and return STRICT JSON only with this shape:
+{
+  "items": [
+    {
+      "bbox": {"x1": int, "y1": int, "x2": int, "y2": int},
+      "name": "short readable name",
+      "category": "top|bottom|shoes|outerwear|accessory|dress",
+      "sub_category": "specific garment type",
+      "occasions": ["casual","office"],
+      "color_name": "primary color words",
+      "pattern": "plain|striped|floral|checked|printed|other",
+      "confidence": 0.0,
+      "reasoning": "short rationale"
+    }
+  ]
+}
+Rules:
+- Return only visible wearable items.
+- Coordinates must be in image pixels.
+- confidence must be [0.0, 1.0].
+- No markdown, no extra text.
+"""
 
 
 class CaptureAnalyzeRequest(BaseModel):
@@ -155,32 +124,6 @@ def _image_duplicate_threshold() -> float:
         return 0.985
 
 
-def _load_detector():
-    global _detector
-    if _detector is not None:
-        return _detector
-    if pipeline is None:
-        return None
-    try:
-        _detector = pipeline("zero-shot-object-detection", model="google/owlvit-base-patch32")
-    except Exception:
-        _detector = None
-    return _detector
-
-
-def _load_classifier():
-    global _classifier
-    if _classifier is not None:
-        return _classifier
-    if pipeline is None:
-        return None
-    try:
-        _classifier = pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
-    except Exception:
-        _classifier = None
-    return _classifier
-
-
 def _decode_image_base64(value: str) -> Image.Image:
     text = (value or "").strip()
     if "," in text:
@@ -240,113 +183,98 @@ def _segment_png_base64(crop: Image.Image) -> str:
     return base64.b64encode(encoded.tobytes()).decode("utf-8")
 
 
-def _label_to_category(label: str) -> Tuple[str, str]:
-    l = (label or "").lower()
-    if any(k in l for k in ["shirt", "blouse", "top", "jacket", "blazer"]):
-        return "top", label
-    if any(k in l for k in ["pants", "trousers", "jeans", "shorts", "skirt"]):
-        return "bottom", label
-    if any(k in l for k in ["dress"]):
-        return "dress", label
-    if any(k in l for k in ["shoe", "sneaker", "heel", "boot", "sandal"]):
-        return "shoes", label
-    if any(k in l for k in ["watch", "bag", "jewelry", "necklace", "earrings", "accessory"]):
-        return "accessory", label
-    return "top", label
+def _normalize_category(value: str) -> str:
+    text = str(value or "").strip().lower()
+    mapping = {
+        "top": "top",
+        "tops": "top",
+        "shirt": "top",
+        "tshirt": "top",
+        "bottom": "bottom",
+        "bottoms": "bottom",
+        "pant": "bottom",
+        "pants": "bottom",
+        "trouser": "bottom",
+        "trousers": "bottom",
+        "shoe": "shoes",
+        "shoes": "shoes",
+        "footwear": "shoes",
+        "outerwear": "outerwear",
+        "jacket": "outerwear",
+        "accessory": "accessory",
+        "accessories": "accessory",
+        "dress": "dress",
+        "dresses": "dress",
+    }
+    for key, out in mapping.items():
+        if key == text or key in text:
+            return out
+    return "top"
 
 
-def _nms_boxes(items: List[Dict[str, Any]], iou_threshold: float = 0.45) -> List[Dict[str, Any]]:
-    def iou(a, b):
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
-        inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
-        iw, ih = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
-        inter = iw * ih
-        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-        area_b = max(1, (bx2 - bx1) * (by2 - by1))
-        return inter / float(area_a + area_b - inter)
-
-    kept: List[Dict[str, Any]] = []
-    sorted_items = sorted(items, key=lambda x: float(x.get("score", 0.0)), reverse=True)
-    for item in sorted_items:
-        box = item.get("bbox_tuple")
-        if box is None:
-            continue
-        if any(iou(box, k.get("bbox_tuple")) > iou_threshold for k in kept):
-            continue
-        kept.append(item)
-    return kept
+def _sanitize_pattern(value: str) -> str:
+    p = str(value or "").strip().lower()
+    if p in {"plain", "striped", "floral", "checked", "printed"}:
+        return p
+    return "plain"
 
 
-def _detect_multi_items(image: Image.Image) -> List[Dict[str, Any]]:
-    detector = _load_detector()
+def _extract_hex_from_text(value: str) -> str:
+    m = re.search(r"#(?:[0-9a-fA-F]{6})\b", str(value or ""))
+    if not m:
+        return ""
+    return m.group(0).upper()
+
+
+def _safe_bbox(raw_bbox: Any, width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
+    if not isinstance(raw_bbox, dict):
+        return None
+    try:
+        x1 = max(0, min(width - 1, int(float(raw_bbox.get("x1", 0)))))
+        y1 = max(0, min(height - 1, int(float(raw_bbox.get("y1", 0)))))
+        x2 = max(1, min(width, int(float(raw_bbox.get("x2", width)))))
+        y2 = max(1, min(height, int(float(raw_bbox.get("y2", height)))))
+    except Exception:
+        return None
+    if x2 <= x1:
+        x2 = min(width, x1 + 2)
+    if y2 <= y1:
+        y2 = min(height, y1 + 2)
+    if (x2 - x1) < 24 or (y2 - y1) < 24:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _llama_detect_items(image_base64: str, *, request_id: str = "") -> List[Dict[str, Any]]:
+    result, _model = ai_gateway.ollama_vision_json(
+        prompt=LLM_CAPTURE_PROMPT,
+        image_base64=(image_base64 or "").split(",", 1)[1] if "," in str(image_base64 or "") else str(image_base64 or ""),
+        request_id=request_id,
+        usecase="vision",
+    )
+    items = result.get("items", []) if isinstance(result, dict) else []
+    return [row for row in items if isinstance(row, dict)]
+
+
+def _fallback_single_item(image: Image.Image) -> List[Dict[str, Any]]:
     width, height = image.size
-
-    if detector is None:
-        # Fallback: one full-image item when detector unavailable.
-        return [
-            {
-                "label": "apparel",
-                "score": 0.35,
-                "bbox_tuple": (0, 0, width, height),
-            }
-        ]
-
-    try:
-        raw = detector(image, candidate_labels=DETECTION_LABELS, threshold=0.10)
-    except Exception:
-        raw = []
-
-    candidates = []
-    for row in raw or []:
-        box = row.get("box", {}) if isinstance(row, dict) else {}
-        xmin = max(0, int(box.get("xmin", 0)))
-        ymin = max(0, int(box.get("ymin", 0)))
-        xmax = min(width, int(box.get("xmax", width)))
-        ymax = min(height, int(box.get("ymax", height)))
-        if xmax - xmin < 24 or ymax - ymin < 24:
-            continue
-        candidates.append(
-            {
-                "label": str(row.get("label", "apparel")),
-                "score": float(row.get("score", 0.0)),
-                "bbox_tuple": (xmin, ymin, xmax, ymax),
-            }
-        )
-
-    deduped = _nms_boxes(candidates, iou_threshold=0.45)
-    if not deduped:
-        deduped = [
-            {
-                "label": "apparel",
-                "score": 0.35,
-                "bbox_tuple": (0, 0, width, height),
-            }
-        ]
-    return deduped[:12]
-
-
-def _classify_crop(crop: Image.Image, detected_label: str) -> Tuple[str, str, float]:
-    clf = _load_classifier()
-    if clf is None:
-        category, sub = _label_to_category(detected_label)
-        return category, sub.lower(), 0.4
-
-    try:
-        ranked = clf(crop, candidate_labels=CLASSIFICATION_LABELS, hypothesis_template="a photo of {}")
-    except Exception:
-        ranked = []
-
-    if not ranked:
-        category, sub = _label_to_category(detected_label)
-        return category, sub.lower(), 0.4
-
-    best = ranked[0]
-    label = str(best.get("label", detected_label)).lower()
-    score = float(best.get("score", 0.4))
-    category, sub = _label_to_category(label)
-    return category, sub.lower(), score
+    crop = image.crop((0, 0, width, height))
+    return [
+        {
+            "item_id": str(uuid.uuid4()),
+            "name": "Detected Outfit Item",
+            "category": "top",
+            "sub_category": "item",
+            "color_code": _dominant_hex(crop),
+            "pattern": "plain",
+            "occasions": ["casual"],
+            "confidence": 0.35,
+            "reasoning": "Fallback item generated because vision JSON was empty or invalid.",
+            "bbox": {"x1": 0, "y1": 0, "x2": width, "y2": height},
+            "raw_crop_base64": _image_to_base64(crop, fmt="JPEG"),
+            "segmented_png_base64": _segment_png_base64(crop),
+        }
+    ]
 
 
 def _draw_overlay(image: Image.Image, items: List[Dict[str, Any]]) -> str:
@@ -362,46 +290,67 @@ def _draw_overlay(image: Image.Image, items: List[Dict[str, Any]]) -> str:
 
 
 @router.post("/analyze")
-def analyze_capture(request: CaptureAnalyzeRequest):
-    return analyze_capture_core(request.user_id, request.image_base64)
+def analyze_capture(http_request: Request, request: CaptureAnalyzeRequest):
+    request_id = str(getattr(http_request.state, "request_id", "") or "")
+    return analyze_capture_core(request.user_id, request.image_base64, request_id=request_id)
 
 
-def analyze_capture_core(user_id: str, image_base64: str):
+def analyze_capture_core(user_id: str, image_base64: str, request_id: str = ""):
     image = _decode_image_base64(image_base64)
-    detections = _detect_multi_items(image)
+    width, height = image.size
+
+    llm_items: List[Dict[str, Any]] = []
+    llm_error = ""
+    try:
+        llm_items = _llama_detect_items(image_base64, request_id=request_id)
+    except Exception as exc:
+        llm_error = str(exc)
+        llm_items = []
 
     items: List[Dict[str, Any]] = []
-    for det in detections:
-        x1, y1, x2, y2 = det["bbox_tuple"]
-        crop = image.crop((x1, y1, x2, y2))
-        category, sub_category, cls_score = _classify_crop(crop, det.get("label", "apparel"))
-        color_code = _dominant_hex(crop)
-        segmented_png_base64 = _segment_png_base64(crop)
-        raw_crop_base64 = _image_to_base64(crop, fmt="JPEG")
+    if llm_items:
+        for row in llm_items:
+            bbox_tuple = _safe_bbox(row.get("bbox"), width, height)
+            if bbox_tuple is None:
+                continue
+            x1, y1, x2, y2 = bbox_tuple
+            crop = image.crop((x1, y1, x2, y2))
+            color_code = _extract_hex_from_text(row.get("color_code")) or _dominant_hex(crop)
+            segmented_png_base64 = _segment_png_base64(crop)
+            raw_crop_base64 = _image_to_base64(crop, fmt="JPEG")
 
-        score = max(float(det.get("score", 0.0)), float(cls_score))
-        item_id = str(uuid.uuid4())
-        reasoning = (
-            f"Detected '{sub_category}' with confidence {round(score, 3)} "
-            f"using object region + visual classification."
-        )
+            sub_category = str(row.get("sub_category") or row.get("name") or "item").strip().lower()
+            category = _normalize_category(str(row.get("category") or ""))
+            occasions_raw = row.get("occasions", ["casual"])
+            occasions = [str(v).strip().lower() for v in (occasions_raw if isinstance(occasions_raw, list) else ["casual"]) if str(v).strip()]
+            if not occasions:
+                occasions = ["casual"]
+            try:
+                confidence = float(row.get("confidence", 0.5))
+            except Exception:
+                confidence = 0.5
+            confidence = max(0.0, min(1.0, confidence))
+            reasoning = str(row.get("reasoning") or "Classified from multimodal visual analysis.").strip()
 
-        items.append(
-            {
-                "item_id": item_id,
-                "name": sub_category.replace("_", " ").title(),
-                "category": category,
-                "sub_category": sub_category,
-                "color_code": color_code,
-                "pattern": "plain",
-                "occasions": ["casual"],
-                "confidence": round(score, 4),
-                "reasoning": reasoning,
-                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                "raw_crop_base64": raw_crop_base64,
-                "segmented_png_base64": segmented_png_base64,
-            }
-        )
+            items.append(
+                {
+                    "item_id": str(uuid.uuid4()),
+                    "name": str(row.get("name") or sub_category.replace("_", " ").title()).strip(),
+                    "category": category,
+                    "sub_category": sub_category,
+                    "color_code": color_code,
+                    "pattern": _sanitize_pattern(str(row.get("pattern") or "plain")),
+                    "occasions": occasions,
+                    "confidence": round(confidence, 4),
+                    "reasoning": reasoning,
+                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "raw_crop_base64": raw_crop_base64,
+                    "segmented_png_base64": segmented_png_base64,
+                }
+            )
+
+    if not items:
+        items = _fallback_single_item(image)
 
     overlay_base64 = _draw_overlay(image, items)
 
@@ -412,6 +361,10 @@ def analyze_capture_core(user_id: str, image_base64: str):
         "message": f"Detected {len(items)} items. Select and save the ones you want.",
         "overlay_preview_base64": overlay_base64,
         "items": items,
+        "meta": {
+            "pipeline": "single_shot_llama" if llm_items else "single_shot_fallback",
+            "llm_error": llm_error or None,
+        },
     }
 
 

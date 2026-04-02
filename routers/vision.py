@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 import prompts
 
 DEFAULT_VISION_ANALYZE_PROMPT = """
-Analyze the garment in the image and return strict JSON only with keys:
+Analyze the object in the image and return strict JSON only with keys:
 name, category, sub_category, occasions, pattern.
 - category must be one of: Tops, Bottoms, Outerwear, Footwear, Dresses, Accessories, Bags, Jewelry, Makeup, Skincare.
 - occasions must be an array of short lowercase strings.
