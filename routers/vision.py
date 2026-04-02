@@ -39,6 +39,18 @@ except Exception:
     remove_background_sync = None
 
 router = APIRouter()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, str(default))).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _vision_enable_similarity() -> bool:
+    # Keep analyze endpoint fast by default; duplicate checks happen in /api/data flow.
+    return _env_bool("VISION_ANALYZE_ENABLE_SIMILARITY", False)
+
+
 def _duplicate_threshold() -> float:
     raw = str(os.getenv("WARDROBE_DUPLICATE_THRESHOLD", "0.97") or "").strip()
     try:
@@ -427,49 +439,52 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
     # -------------------------
     # STEP 4: EMBEDDING + SIMILARITY CHECK
     # -------------------------
-    vector = None
-    similar_items = []
-    try:
-        vector = encode_metadata(final_data)
-        similar_items = qdrant_service.search_similar(vector, user_id, limit=5)
-    except Exception as e:
-        print("Qdrant similarity search error:", str(e))
-
-    image_vector = encode_image_base64(vision_input_base64)
     image_duplicate = {
         "checked": False,
         "is_duplicate": False,
         "id": None,
         "score": 0.0,
     }
-    image_duplicate_threshold = _image_duplicate_threshold()
-    if image_vector:
-        try:
-            image_duplicate = qdrant_service.find_image_duplicate(
-                image_vector,
-                user_id,
-                threshold=image_duplicate_threshold,
-            )
-        except Exception as e:
-            print("Qdrant image duplicate check error:", str(e))
-
-    pixel_hash = compute_pixel_hash_from_base64(vision_input_base64)
     pixel_duplicate = {
         "checked": False,
         "is_duplicate": False,
         "id": None,
         "distance": None,
     }
+    vector = None
+    similar_items = []
+    image_vector = []
+    pixel_hash = ""
+    image_duplicate_threshold = _image_duplicate_threshold()
     pixel_max_distance = _pixel_duplicate_distance()
-    if pixel_hash:
+    if _vision_enable_similarity():
         try:
-            pixel_duplicate = qdrant_service.find_pixel_duplicate(
-                user_id,
-                pixel_hash,
-                max_distance=pixel_max_distance,
-            )
+            vector = encode_metadata(final_data)
+            similar_items = qdrant_service.search_similar(vector, user_id, limit=5)
         except Exception as e:
-            print("Qdrant pixel duplicate check error:", str(e))
+            print("Qdrant similarity search error:", str(e))
+
+        image_vector = encode_image_base64(vision_input_base64)
+        if image_vector:
+            try:
+                image_duplicate = qdrant_service.find_image_duplicate(
+                    image_vector,
+                    user_id,
+                    threshold=image_duplicate_threshold,
+                )
+            except Exception as e:
+                print("Qdrant image duplicate check error:", str(e))
+
+        pixel_hash = compute_pixel_hash_from_base64(vision_input_base64)
+        if pixel_hash:
+            try:
+                pixel_duplicate = qdrant_service.find_pixel_duplicate(
+                    user_id,
+                    pixel_hash,
+                    max_distance=pixel_max_distance,
+                )
+            except Exception as e:
+                print("Qdrant pixel duplicate check error:", str(e))
 
     duplicate_threshold = _duplicate_threshold()
     top_similarity_score = 0.0
@@ -498,6 +513,7 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
             "bg_fallback_reason": bg_fallback_reason,
             "llm_fallback": llm_fallback,
             "vision_model_used": model_used,
+            "similarity_enabled": _vision_enable_similarity(),
             "embedding_created": vector is not None,
             "similar_items_found": len(similar_items),
             "duplicate_threshold": duplicate_threshold,

@@ -3,6 +3,9 @@ import uuid
 import re
 import os
 import base64
+import time
+import hashlib
+from threading import Lock
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
@@ -24,6 +27,11 @@ from services import data_access_service
 router = APIRouter(prefix="/api/data", tags=["data"])
 proxy = AppwriteProxy()
 
+_DUPLICATE_ONE_SHOT_TTL_SECONDS = max(10, int(os.getenv("OUTFIT_DUPLICATE_ONE_SHOT_TTL_SECONDS", "90")))
+_DUPLICATE_ONE_SHOT_MAX = max(32, int(os.getenv("OUTFIT_DUPLICATE_ONE_SHOT_MAX", "512")))
+_DUPLICATE_ONE_SHOT_CACHE: Dict[str, Dict[str, Any]] = {}
+_DUPLICATE_ONE_SHOT_LOCK = Lock()
+
 RESOURCE_ALIASES = {
     "meal_planner": "meal_plans",
     "meal": "meal_plans",
@@ -44,6 +52,45 @@ RESOURCE_ALIASES = {
 def _normalize_resource_key(resource: str) -> str:
     key = str(resource or "").strip()
     return RESOURCE_ALIASES.get(key, key)
+
+
+def _dup_cache_key(*, user_id: str, pixel_hash: str) -> str:
+    uid = str(user_id or "").strip()
+    ph = str(pixel_hash or "").strip().lower()
+    if not uid or not ph:
+        return ""
+    digest = hashlib.sha1(f"{uid}|{ph}".encode("utf-8")).hexdigest()
+    return f"dup1:{digest}"
+
+
+def _dup_cache_put(*, key: str, result: Dict[str, Any]) -> None:
+    if not key or not isinstance(result, dict):
+        return
+    now = time.time()
+    with _DUPLICATE_ONE_SHOT_LOCK:
+        _DUPLICATE_ONE_SHOT_CACHE[key] = {"ts": now, "result": dict(result)}
+        if len(_DUPLICATE_ONE_SHOT_CACHE) > _DUPLICATE_ONE_SHOT_MAX:
+            victims = sorted(
+                _DUPLICATE_ONE_SHOT_CACHE.items(),
+                key=lambda kv: float((kv[1] or {}).get("ts") or 0.0),
+            )[: max(0, len(_DUPLICATE_ONE_SHOT_CACHE) - _DUPLICATE_ONE_SHOT_MAX)]
+            for victim_key, _ in victims:
+                _DUPLICATE_ONE_SHOT_CACHE.pop(victim_key, None)
+
+
+def _dup_cache_pop(*, key: str) -> Dict[str, Any] | None:
+    if not key:
+        return None
+    now = time.time()
+    with _DUPLICATE_ONE_SHOT_LOCK:
+        row = _DUPLICATE_ONE_SHOT_CACHE.pop(key, None)
+    if not isinstance(row, dict):
+        return None
+    ts = float(row.get("ts") or 0.0)
+    if ts <= 0.0 or (now - ts) > _DUPLICATE_ONE_SHOT_TTL_SECONDS:
+        return None
+    payload = row.get("result")
+    return dict(payload) if isinstance(payload, dict) else None
 
 
 class CreateRequest(BaseModel):
@@ -1100,6 +1147,10 @@ def check_outfit_duplicate(request: OutfitDuplicateCheckRequest):
         incoming_image_vector=incoming_image_vector,
         incoming_pixel_hash=incoming_pixel_hash,
     )
+    cache_pixel_hash = str(result.get("payload_pixel_hash") or "").strip().lower()
+    cache_key = _dup_cache_key(user_id=duplicate_user_id, pixel_hash=cache_pixel_hash)
+    if cache_key:
+        _dup_cache_put(key=cache_key, result=result)
     duplicate_meta = dict(result.get("duplicate_meta") or {})
     duplicate = dict(result.get("duplicate") or {})
 
@@ -1180,12 +1231,19 @@ def create_document(request: CreateRequest):
             duplicate_user_id = str(payload.get("userId") or request.user_id or "").strip()
             duplicate_meta["checked"] = bool(duplicate_user_id)
             if duplicate_user_id and not request.force_save:
-                duplicate_result = _run_outfit_duplicate_check(
-                    payload=payload,
-                    duplicate_user_id=duplicate_user_id,
-                    incoming_image_vector=incoming_image_vector,
-                    incoming_pixel_hash=incoming_pixel_hash,
-                )
+                duplicate_result = None
+                if incoming_pixel_hash:
+                    cached_key = _dup_cache_key(user_id=duplicate_user_id, pixel_hash=incoming_pixel_hash)
+                    duplicate_result = _dup_cache_pop(key=cached_key)
+                if not isinstance(duplicate_result, dict):
+                    duplicate_result = _run_outfit_duplicate_check(
+                        payload=payload,
+                        duplicate_user_id=duplicate_user_id,
+                        incoming_image_vector=incoming_image_vector,
+                        incoming_pixel_hash=incoming_pixel_hash,
+                    )
+                else:
+                    print(f"[data.create_document] outfits duplicate_check cache_hit user={duplicate_user_id}")
                 duplicate_meta = dict(duplicate_result.get("duplicate_meta") or duplicate_meta)
                 duplicate_meta["forced_save"] = bool(request.force_save)
                 payload_image_vector = list(duplicate_result.get("payload_image_vector") or [])
