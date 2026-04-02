@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 from brain.agent_system import agent_system
 from brain.context.context_engine import context_engine
@@ -554,6 +555,7 @@ class AhviOrchestrator:
             appwrite=appwrite,
             user_id=user_id,
             request_id=request_id,
+            context=context,
         )
         if not allowed:
             return {
@@ -600,9 +602,11 @@ class AhviOrchestrator:
         appwrite: AppwriteProxy,
         user_id: str,
         request_id: str,
+        context: Dict[str, Any],
     ) -> tuple[bool, int, int, int]:
         limit = max(1, int(getattr(settings, "try_on_daily_limit", 2) or 2))
-        today = datetime.now().astimezone().date().isoformat()
+        tz_name = self._user_timezone_name(context)
+        today = self._today_in_timezone(tz_name)
         used = 0
         try:
             rows = self._normalize_documents(appwrite.list_documents("jobs", user_id=user_id, limit=300))
@@ -627,7 +631,7 @@ class AhviOrchestrator:
                     "userId": str(user_id),
                     "type": "try_on",
                     "status": "completed",
-                    "input": "try_on",
+                    "input": f"try_on|tz={tz_name}",
                     "output": "prepared",
                     "error": "",
                     "retry_count": 0,
@@ -640,6 +644,34 @@ class AhviOrchestrator:
 
         used_after = used + 1
         return True, max(0, limit - used_after), used_after, limit
+
+    def _user_timezone_name(self, context: Dict[str, Any]) -> str:
+        profile = context.get("user_profile", {}) if isinstance(context, dict) else {}
+        if not isinstance(profile, dict):
+            profile = {}
+        location = profile.get("location", {})
+        if not isinstance(location, dict):
+            location = {}
+        for value in (
+            profile.get("timezone"),
+            profile.get("time_zone"),
+            profile.get("tz"),
+            location.get("timezone"),
+            location.get("time_zone"),
+            location.get("tz"),
+        ):
+            zone = str(value or "").strip()
+            if zone:
+                return zone
+        return "UTC"
+
+    @staticmethod
+    def _today_in_timezone(tz_name: str) -> str:
+        zone = str(tz_name or "").strip() or "UTC"
+        try:
+            return datetime.now(ZoneInfo(zone)).date().isoformat()
+        except Exception:
+            return datetime.now().astimezone().date().isoformat()
 
     def _cache_key(self, text: str, user_id: str, context: Dict[str, Any]) -> str:
         wardrobe = context.get("wardrobe", []) or []
