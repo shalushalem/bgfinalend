@@ -261,6 +261,9 @@ def _build_smart_fallback(color_hex: str, hint_category: str = "Tops", hint_sub_
     }
 
 
+# ----------------------------------------------------
+# UPDATED CATEGORY ALIASES (Generic words removed)
+# ----------------------------------------------------
 _CATEGORY_ALIASES = {
     "top": "Tops",
     "tops": "Tops",
@@ -296,8 +299,8 @@ _CATEGORY_ALIASES = {
     "dresses": "Dresses",
     "gown": "Dresses",
     "jumpsuit": "Dresses",
-    "accessory": "Accessories",
-    "accessories": "Accessories",
+    
+    # Specific accessories remain, broad trigger words removed
     "belt": "Accessories",
     "scarf": "Accessories",
     "hat": "Accessories",
@@ -343,33 +346,48 @@ def _clean_text(value) -> str:
     return str(value).strip()
 
 
+# ----------------------------------------------------
+# UPDATED CLASSIFIER LOGIC WITH SAFEGUARDS & LOGGING
+# ----------------------------------------------------
 def _canonicalize_category(category: str, sub_category: str, name: str, hint_category: str) -> str:
+    print("\n--- DEBUG: AI RAW CLASSIFICATION ---")
+    print(f"Category: {category} | Sub: {sub_category} | Name: {name} | Hint: {hint_category}")
+    
     candidates = [category, sub_category, name, hint_category]
 
-    # Pass 1: Try exact matches on ALL fields first (Safest)
+    # Pass 1: Try exact matches first
     for candidate in candidates:
         key = _clean_text(candidate).lower()
-        # Strip common broad taxonomies that confuse the categorizer
-        key = key.replace(" & accessories", "").replace(" and accessories", "")
+        # Remove generic junk taxonomy strings
+        key = key.replace(" & accessories", "").replace(" and accessories", "").replace("fashion ", "")
         
         if key in _CATEGORY_ALIASES:
+            print(f"--- DEBUG: Matched Exact Pass -> '{key}' becomes {_CATEGORY_ALIASES[key]}\n")
             return _CATEGORY_ALIASES[key]
 
-    # Pass 2: Token-by-token matching ONLY if no exact match is found
+    # Pass 2: Token-by-token matching (with safeguards)
     for candidate in candidates:
         key = _clean_text(candidate).lower()
         tokens = key.replace("/", " ").replace("-", " ").split()
 
         for token in tokens:
-            # Prevent "cap sleeve" from being marked as a hat (accessory)
-            if token == "cap" and "sleeve" in tokens:
+            # SAFEGUARDS: Prevent common clothing features from triggering 'Accessories'
+            if token == "cap" and "sleeve" in tokens: 
+                continue
+            if token == "belt" and any(word in tokens for word in ["dress", "pants", "jeans", "trouser"]): 
+                continue
+            if token == "bag" and "paper" in tokens: # e.g. "paper bag waist"
                 continue
                 
             if token in _CATEGORY_ALIASES:
+                print(f"--- DEBUG: Matched Token Pass -> '{token}' becomes {_CATEGORY_ALIASES[token]}\n")
                 return _CATEGORY_ALIASES[token]
 
-    # Fallback to the hint category (Tops/Bottoms)
-    return _CATEGORY_ALIASES.get(_clean_text(hint_category).lower(), "Tops")
+    # Pass 3: Safe Fallback
+    fallback = _CATEGORY_ALIASES.get(_clean_text(hint_category).lower(), "Tops")
+    print(f"--- DEBUG: No match found. Falling back to -> {fallback}\n")
+    return fallback
+
 
 def _normalize_occasions(value) -> list[str]:
     if isinstance(value, list):
