@@ -8,16 +8,9 @@ from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from sklearn.cluster import KMeans
 
-import prompts
+# Import the new prompt from the prompts folder
+from prompts.core_prompts import VISION_ANALYZE_PROMPT
 
-DEFAULT_VISION_ANALYZE_PROMPT = """
-Analyze the object in the image and return strict JSON only with keys:
-name, category, sub_category, occasions, pattern.
-- category must be one of: Tops, Bottoms, Outerwear, Footwear, Dresses, Accessories, Bags, Jewelry, Makeup, Skincare.
-- occasions must be an array of short lowercase strings.
-- pattern should be a short lowercase string (e.g. plain, striped, checked, floral).
-Do not include markdown fences or extra text.
-"""
 from services.embedding_service import encode_metadata
 from services.image_embedding_service import encode_image_base64
 from services.image_fingerprint import compute_pixel_hash_from_base64
@@ -47,7 +40,6 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _vision_enable_similarity() -> bool:
-    # Keep analyze endpoint fast by default; duplicate checks happen in /api/data flow.
     return _env_bool("VISION_ANALYZE_ENABLE_SIMILARITY", False)
 
 
@@ -145,26 +137,16 @@ def _hex_to_color_name(hex_color: str) -> str:
     except Exception:
         return "Multicolor"
 
-    if max(r, g, b) < 40:
-        return "Black"
-    if min(r, g, b) > 220:
-        return "White"
-    if abs(r - g) < 14 and abs(g - b) < 14:
-        return "Gray"
-    if r > 180 and g < 110 and b < 110:
-        return "Red"
-    if r > 170 and g > 120 and b < 90:
-        return "Orange"
-    if r > 170 and g > 170 and b < 90:
-        return "Yellow"
-    if g > 150 and r < 130 and b < 130:
-        return "Green"
-    if b > 150 and r < 130 and g < 150:
-        return "Blue"
-    if r > 150 and b > 150 and g < 130:
-        return "Purple"
-    if r > 140 and g > 100 and b > 70:
-        return "Brown"
+    if max(r, g, b) < 40: return "Black"
+    if min(r, g, b) > 220: return "White"
+    if abs(r - g) < 14 and abs(g - b) < 14: return "Gray"
+    if r > 180 and g < 110 and b < 110: return "Red"
+    if r > 170 and g > 120 and b < 90: return "Orange"
+    if r > 170 and g > 170 and b < 90: return "Yellow"
+    if g > 150 and r < 130 and b < 130: return "Green"
+    if b > 150 and r < 130 and g < 150: return "Blue"
+    if r > 150 and b > 150 and g < 130: return "Purple"
+    if r > 140 and g > 100 and b > 70: return "Brown"
     return "Multicolor"
 
 
@@ -184,27 +166,21 @@ def _extract_foreground_mask(decoded_img) -> np.ndarray | None:
             return None
 
         if decoded_img.ndim == 3 and decoded_img.shape[2] == 4:
-            # BGRA image from background-removal step.
             alpha = decoded_img[:, :, 3]
             mask = alpha > 18
         else:
             bgr = decoded_img if decoded_img.ndim == 3 else None
-            if bgr is None:
-                return None
+            if bgr is None: return None
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
             maxc = rgb.max(axis=2)
             minc = rgb.min(axis=2)
             near_white = (
-                (rgb[:, :, 0] >= 236)
-                & (rgb[:, :, 1] >= 236)
-                & (rgb[:, :, 2] >= 236)
-                & ((maxc - minc) <= 20)
+                (rgb[:, :, 0] >= 236) & (rgb[:, :, 1] >= 236) & (rgb[:, :, 2] >= 236) & ((maxc - minc) <= 20)
             )
             saturated = hsv[:, :, 1] > 18
             mask = (~near_white) | saturated
 
-        # Remove tiny noise.
         mask_u8 = mask.astype(np.uint8) * 255
         kernel = np.ones((3, 3), np.uint8)
         mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -219,11 +195,6 @@ def _extract_foreground_mask(decoded_img) -> np.ndarray | None:
 
 
 def _infer_garment_hint(decoded_img) -> tuple[str, str]:
-    """
-    Returns a coarse garment hint from silhouette:
-    - Tops/Shirt
-    - Bottoms/Trousers
-    """
     mask = _extract_foreground_mask(decoded_img)
     if mask is None:
         return ("Tops", "Shirt")
@@ -281,22 +252,153 @@ def _infer_garment_hint(decoded_img) -> tuple[str, str]:
 
 def _build_smart_fallback(color_hex: str, hint_category: str = "Tops", hint_sub_category: str = "Shirt"):
     color_name = _hex_to_color_name(color_hex)
-    category = hint_category
-    sub_category = hint_sub_category
-    occasions = ["casual", "office"]
-    name = f"{color_name} {sub_category}"
     return {
-        "name": name,
-        "category": category,
-        "sub_category": sub_category,
-        "occasions": occasions,
+        "name": f"{color_name} {hint_sub_category}",
+        "category": hint_category,
+        "sub_category": hint_sub_category,
+        "occasions": ["casual", "office"],
         "pattern": "plain",
     }
 
 
-# -------------------------
-# COLOR EXTRACTION
-# -------------------------
+_CATEGORY_ALIASES = {
+    "top": "Tops",
+    "tops": "Tops",
+    "shirt": "Tops",
+    "t-shirt": "Tops",
+    "tee": "Tops",
+    "blouse": "Tops",
+    "bottom": "Bottoms",
+    "bottoms": "Bottoms",
+    "trouser": "Bottoms",
+    "trousers": "Bottoms",
+    "pants": "Bottoms",
+    "jeans": "Bottoms",
+    "skirt": "Bottoms",
+    "shorts": "Bottoms",
+    "shoe": "Footwear",
+    "shoes": "Footwear",
+    "footwear": "Footwear",
+    "sneaker": "Footwear",
+    "sneakers": "Footwear",
+    "heel": "Footwear",
+    "heels": "Footwear",
+    "boot": "Footwear",
+    "boots": "Footwear",
+    "sandal": "Footwear",
+    "sandals": "Footwear",
+    "outerwear": "Outerwear",
+    "jacket": "Outerwear",
+    "coat": "Outerwear",
+    "blazer": "Outerwear",
+    "hoodie": "Outerwear",
+    "dress": "Dresses",
+    "dresses": "Dresses",
+    "gown": "Dresses",
+    "jumpsuit": "Dresses",
+    "accessory": "Accessories",
+    "accessories": "Accessories",
+    "belt": "Accessories",
+    "scarf": "Accessories",
+    "hat": "Accessories",
+    "cap": "Accessories",
+    "sunglasses": "Accessories",
+    "bag": "Bags",
+    "bags": "Bags",
+    "handbag": "Bags",
+    "backpack": "Bags",
+    "tote": "Bags",
+    "jewelry": "Jewelry",
+    "jewellery": "Jewelry",
+    "watch": "Jewelry",
+    "necklace": "Jewelry",
+    "earring": "Jewelry",
+    "bracelet": "Jewelry",
+    "ring": "Jewelry",
+    "indian wear": "Indian Wear",
+    "ethnic": "Indian Wear",
+    "saree": "Indian Wear",
+    "kurta": "Indian Wear",
+    "lehenga": "Indian Wear",
+    "salwar": "Indian Wear",
+}
+
+
+_DEFAULT_SUB_BY_CATEGORY = {
+    "Tops": "Shirt",
+    "Bottoms": "Trousers",
+    "Footwear": "Shoes",
+    "Outerwear": "Jacket",
+    "Accessories": "Accessory",
+    "Dresses": "Dress",
+    "Bags": "Bag",
+    "Jewelry": "Jewelry",
+    "Indian Wear": "Kurta",
+}
+
+
+def _clean_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _canonicalize_category(category: str, sub_category: str, name: str, hint_category: str) -> str:
+    for candidate in (category, sub_category, name, hint_category):
+        key = _clean_text(candidate).lower()
+        if key in _CATEGORY_ALIASES:
+            return _CATEGORY_ALIASES[key]
+
+        # Handle phrases like "black accessory" or "casual sneakers".
+        for token in key.replace("/", " ").replace("-", " ").split():
+            if token in _CATEGORY_ALIASES:
+                return _CATEGORY_ALIASES[token]
+
+    return _CATEGORY_ALIASES.get(_clean_text(hint_category).lower(), "Tops")
+
+
+def _normalize_occasions(value) -> list[str]:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            text = _clean_text(item)
+            if text:
+                out.append(text.lower())
+        return out
+    if isinstance(value, str):
+        items = [part.strip().lower() for part in value.split(",")]
+        return [item for item in items if item]
+    return []
+
+
+def _shape_vision_output(raw_data, color_hex: str, hint_category: str, hint_sub_category: str, cv_image) -> dict:
+    data = dict(raw_data) if isinstance(raw_data, dict) else {}
+
+    name = _clean_text(data.get("name") or data.get("title") or data.get("item_name"))
+    category = _clean_text(data.get("category") or data.get("main_category") or data.get("type"))
+    sub_category = _clean_text(data.get("sub_category") or data.get("subcategory") or data.get("subType"))
+    pattern = _clean_text(data.get("pattern") or data.get("texture"))
+    occasions = _normalize_occasions(data.get("occasions") or data.get("occasion"))
+
+    canonical_category = _canonicalize_category(category, sub_category, name, hint_category)
+    if not sub_category:
+        sub_category = _clean_text(hint_sub_category) or _DEFAULT_SUB_BY_CATEGORY.get(canonical_category, "Item")
+    if not name:
+        color_name = _hex_to_color_name(color_hex)
+        name = f"{color_name} {sub_category}".strip()
+    if not pattern:
+        pattern = _infer_pattern(cv_image)
+    if not occasions:
+        occasions = ["casual", "office"]
+
+    data["name"] = name
+    data["category"] = canonical_category
+    data["sub_category"] = sub_category
+    data["pattern"] = pattern
+    data["occasions"] = occasions
+    return data
+
+
 def get_dominant_color(cv_image, k=3):
     try:
         image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
@@ -334,26 +436,17 @@ def get_dominant_color(cv_image, k=3):
         return "#000000"
 
 
-# -------------------------
-# MAIN ENDPOINT
-# -------------------------
 @router.post("/analyze-image")
 def analyze_image(request: ImageAnalyzeRequest):
     return vision_analyze_core(request.image_base64, request.userId)
 
 
 def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
-    # -------------------------
     # STEP 0: BG REMOVAL FIRST
-    # -------------------------
     vision_input_base64, bg_removed, bg_fallback_reason = _remove_bg_first(image_base64)
-    print("Vision preprocess BG:", {"bg_removed": bg_removed, "reason": bg_fallback_reason})
 
-    # -------------------------
     # STEP 1: Decode + Color
-    # -------------------------
     base64_data = _normalize_base64_for_model(vision_input_base64)
-
     try:
         img_data = base64.b64decode(base64_data, validate=True)
         if len(img_data) > 12 * 1024 * 1024:
@@ -381,82 +474,47 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image payload: {str(e)}")
 
-    # -------------------------
-    # STEP 2: LLM ANALYSIS
-    # -------------------------
+    # STEP 2: RAW LLM ANALYSIS (Using imported prompt)
     llm_fallback = False
     model_used = None
     try:
         final_data, model_used = ai_gateway.ollama_vision_json(
-            prompt=getattr(prompts, "VISION_ANALYZE_PROMPT", DEFAULT_VISION_ANALYZE_PROMPT),
+            prompt=VISION_ANALYZE_PROMPT,
             image_base64=_normalize_base64_for_model(vision_input_base64),
         )
-
     except Exception as e:
         print(f"Image Analyze Error: {str(e)}")
         llm_fallback = True
+        # Keep smart fallback ONLY if LLM completely crashes
         final_data = _build_smart_fallback(
             extracted_color_hex,
             hint_category=hint_category,
             hint_sub_category=hint_sub_category,
         )
 
-    # Normalize weak LLM answers to practical defaults.
-    name = str(final_data.get("name", "")).strip()
-    if not name or name.lower() in {"new garment", "garment", "new item", "item"}:
-        final_data["name"] = _build_smart_fallback(
-            extracted_color_hex,
-            hint_category=hint_category,
-            hint_sub_category=hint_sub_category,
-        )["name"]
+    final_data = _shape_vision_output(
+        final_data,
+        color_hex=extracted_color_hex,
+        hint_category=hint_category,
+        hint_sub_category=hint_sub_category,
+        cv_image=cv_image,
+    )
 
-    category = str(final_data.get("category", "")).strip()
-    if not category:
-        final_data["category"] = hint_category
-    elif category.lower() == "tops" and hint_category == "Bottoms" and llm_fallback:
-        # If LLM failed and heuristic strongly suggests bottoms, trust heuristic.
-        final_data["category"] = hint_category
-
-    sub_category = str(final_data.get("sub_category", "")).strip()
-    if not sub_category or sub_category.lower() in {"unknown", "other", "na", "n/a"}:
-        final_data["sub_category"] = hint_sub_category
-    elif sub_category.lower() == "shirt" and hint_sub_category == "Trousers" and llm_fallback:
-        final_data["sub_category"] = hint_sub_category
-
-    occasions = final_data.get("occasions", [])
-    if not isinstance(occasions, list) or not occasions:
-        final_data["occasions"] = ["casual", "office"]
-
-    if not final_data.get("pattern"):
-        final_data["pattern"] = _infer_pattern(cv_image)
-
-    # -------------------------
-    # STEP 3: FORCE TRUE COLOR
-    # -------------------------
-    final_data["color_code"] = extracted_color_hex
+    # STEP 3: PREPARE DATA
+    # Use extracted hex ONLY if the LLM failed to provide a color code
+    final_data["color_code"] = _clean_text(final_data.get("color_code")) or extracted_color_hex
     final_data["userId"] = user_id
 
-    # -------------------------
     # STEP 4: EMBEDDING + SIMILARITY CHECK
-    # -------------------------
-    image_duplicate = {
-        "checked": False,
-        "is_duplicate": False,
-        "id": None,
-        "score": 0.0,
-    }
-    pixel_duplicate = {
-        "checked": False,
-        "is_duplicate": False,
-        "id": None,
-        "distance": None,
-    }
+    image_duplicate = {"checked": False, "is_duplicate": False, "id": None, "score": 0.0}
+    pixel_duplicate = {"checked": False, "is_duplicate": False, "id": None, "distance": None}
     vector = None
     similar_items = []
     image_vector = []
     pixel_hash = ""
     image_duplicate_threshold = _image_duplicate_threshold()
     pixel_max_distance = _pixel_duplicate_distance()
+
     if _vision_enable_similarity():
         try:
             vector = encode_metadata(final_data)
@@ -468,9 +526,7 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
         if image_vector:
             try:
                 image_duplicate = qdrant_service.find_image_duplicate(
-                    image_vector,
-                    user_id,
-                    threshold=image_duplicate_threshold,
+                    image_vector, user_id, threshold=image_duplicate_threshold,
                 )
             except Exception as e:
                 print("Qdrant image duplicate check error:", str(e))
@@ -479,29 +535,20 @@ def vision_analyze_core(image_base64: str, user_id: str = "demo_user"):
         if pixel_hash:
             try:
                 pixel_duplicate = qdrant_service.find_pixel_duplicate(
-                    user_id,
-                    pixel_hash,
-                    max_distance=pixel_max_distance,
+                    user_id, pixel_hash, max_distance=pixel_max_distance,
                 )
             except Exception as e:
                 print("Qdrant pixel duplicate check error:", str(e))
 
     duplicate_threshold = _duplicate_threshold()
-    top_similarity_score = 0.0
-    if similar_items:
-        try:
-            top_similarity_score = float(similar_items[0].get("score") or 0.0)
-        except Exception:
-            top_similarity_score = 0.0
+    top_similarity_score = float(similar_items[0].get("score") or 0.0) if similar_items else 0.0
+
     probable_duplicate = bool(
         image_duplicate.get("is_duplicate")
         or pixel_duplicate.get("is_duplicate")
         or top_similarity_score >= duplicate_threshold
     )
 
-    # -------------------------
-    # RESPONSE
-    # -------------------------
     return {
         "success": True,
         "data": final_data,

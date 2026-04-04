@@ -11,6 +11,9 @@ from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 
+# Import the new prompt from the prompts folder
+from prompts.core_prompts import WARDROBE_CAPTURE_PROMPT
+
 from services.wardrobe_persistence_service import persist_selected_items
 from services import ai_gateway
 try:
@@ -27,31 +30,6 @@ from services.task_queue import enqueue_task
 
 
 router = APIRouter(prefix="/api/wardrobe/capture", tags=["wardrobe-capture"])
-
-LLM_CAPTURE_PROMPT = """
-You are a wardrobe parser.
-Analyze the image and return STRICT JSON only with this shape:
-{
-  "items": [
-    {
-      "bbox": {"x1": int, "y1": int, "x2": int, "y2": int},
-      "name": "short readable name",
-      "category": "top|bottom|shoes|outerwear|accessory|dress",
-      "sub_category": "specific garment type",
-      "occasions": ["casual","office"],
-      "color_name": "primary color words",
-      "pattern": "plain|striped|floral|checked|printed|other",
-      "confidence": 0.0,
-      "reasoning": "short rationale"
-    }
-  ]
-}
-Rules:
-- Return only visible wearable items.
-- Coordinates must be in image pixels.
-- confidence must be [0.0, 1.0].
-- No markdown, no extra text.
-"""
 
 
 class CaptureAnalyzeRequest(BaseModel):
@@ -183,42 +161,6 @@ def _segment_png_base64(crop: Image.Image) -> str:
     return base64.b64encode(encoded.tobytes()).decode("utf-8")
 
 
-def _normalize_category(value: str) -> str:
-    text = str(value or "").strip().lower()
-    mapping = {
-        "top": "top",
-        "tops": "top",
-        "shirt": "top",
-        "tshirt": "top",
-        "bottom": "bottom",
-        "bottoms": "bottom",
-        "pant": "bottom",
-        "pants": "bottom",
-        "trouser": "bottom",
-        "trousers": "bottom",
-        "shoe": "shoes",
-        "shoes": "shoes",
-        "footwear": "shoes",
-        "outerwear": "outerwear",
-        "jacket": "outerwear",
-        "accessory": "accessory",
-        "accessories": "accessory",
-        "dress": "dress",
-        "dresses": "dress",
-    }
-    for key, out in mapping.items():
-        if key == text or key in text:
-            return out
-    return "top"
-
-
-def _sanitize_pattern(value: str) -> str:
-    p = str(value or "").strip().lower()
-    if p in {"plain", "striped", "floral", "checked", "printed"}:
-        return p
-    return "plain"
-
-
 def _extract_hex_from_text(value: str) -> str:
     m = re.search(r"#(?:[0-9a-fA-F]{6})\b", str(value or ""))
     if not m:
@@ -247,7 +189,7 @@ def _safe_bbox(raw_bbox: Any, width: int, height: int) -> Optional[Tuple[int, in
 
 def _llama_detect_items(image_base64: str, *, request_id: str = "") -> List[Dict[str, Any]]:
     result, _model = ai_gateway.ollama_vision_json(
-        prompt=LLM_CAPTURE_PROMPT,
+        prompt=WARDROBE_CAPTURE_PROMPT,
         image_base64=(image_base64 or "").split(",", 1)[1] if "," in str(image_base64 or "") else str(image_base64 or ""),
         request_id=request_id,
         usecase="vision",
@@ -263,7 +205,7 @@ def _fallback_single_item(image: Image.Image) -> List[Dict[str, Any]]:
         {
             "item_id": str(uuid.uuid4()),
             "name": "Detected Outfit Item",
-            "category": "top",
+            "category": "Tops",
             "sub_category": "item",
             "color_code": _dominant_hex(crop),
             "pattern": "plain",
@@ -315,32 +257,36 @@ def analyze_capture_core(user_id: str, image_base64: str, request_id: str = ""):
                 continue
             x1, y1, x2, y2 = bbox_tuple
             crop = image.crop((x1, y1, x2, y2))
+            
+            # Prioritize LLM color code if provided, otherwise fallback to math
             color_code = _extract_hex_from_text(row.get("color_code")) or _dominant_hex(crop)
             segmented_png_base64 = _segment_png_base64(crop)
             raw_crop_base64 = _image_to_base64(crop, fmt="JPEG")
 
-            sub_category = str(row.get("sub_category") or row.get("name") or "item").strip().lower()
-            category = _normalize_category(str(row.get("category") or ""))
-            occasions_raw = row.get("occasions", ["casual"])
-            occasions = [str(v).strip().lower() for v in (occasions_raw if isinstance(occasions_raw, list) else ["casual"]) if str(v).strip()]
-            if not occasions:
-                occasions = ["casual"]
+            # RAW PASS-THROUGH (No normalization filters)
+            raw_name = str(row.get("name", "Item")).strip()
+            raw_category = str(row.get("category", "")).strip()
+            raw_sub_category = str(row.get("sub_category", "")).strip()
+            raw_pattern = str(row.get("pattern", "")).strip()
+            raw_occasions = row.get("occasions", [])
+
             try:
                 confidence = float(row.get("confidence", 0.5))
             except Exception:
                 confidence = 0.5
             confidence = max(0.0, min(1.0, confidence))
-            reasoning = str(row.get("reasoning") or "Classified from multimodal visual analysis.").strip()
+            
+            reasoning = str(row.get("reasoning", "")).strip()
 
             items.append(
                 {
                     "item_id": str(uuid.uuid4()),
-                    "name": str(row.get("name") or sub_category.replace("_", " ").title()).strip(),
-                    "category": category,
-                    "sub_category": sub_category,
+                    "name": raw_name,
+                    "category": raw_category,
+                    "sub_category": raw_sub_category,
                     "color_code": color_code,
-                    "pattern": _sanitize_pattern(str(row.get("pattern") or "plain")),
-                    "occasions": occasions,
+                    "pattern": raw_pattern,
+                    "occasions": raw_occasions,
                     "confidence": round(confidence, 4),
                     "reasoning": reasoning,
                     "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},

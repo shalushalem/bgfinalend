@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple
 from brain.engines.styling.style_builder import style_engine
 from brain.ml.outfit_ranker import outfit_ranker
 from brain.style_graph_engine import style_graph_engine
+from services import ai_gateway
 from services.appwrite_proxy import AppwriteProxy
 from services.embedding_service import get_model
 from services.qdrant_service import qdrant_service
@@ -141,6 +142,8 @@ def _normalize_wardrobe(raw_wardrobe: Any) -> Dict[str, List[Dict[str, Any]]]:
         "bottoms": [],
         "shoes": [],
         "outerwear": [],
+        "dresses": [],
+        "accessories": [],
     }
 
     def _add(raw: Dict[str, Any]) -> None:
@@ -157,10 +160,20 @@ def _normalize_wardrobe(raw_wardrobe: Any) -> Dict[str, List[Dict[str, Any]]]:
         if any(x in name for x in ["shoe", "sneaker", "boot", "heel", "sandal"]):
             parts["shoes"].append(_normalize_item(raw, "shoes"))
             return
+        if "dress" in name or "gown" in name:
+            parts["dresses"].append(_normalize_item(raw, "dress"))
+            return
+        if any(x in name for x in ["bag", "watch", "necklace", "earring", "bracelet", "belt", "scarf", "cap", "hat"]):
+            parts["accessories"].append(_normalize_item(raw, "accessory"))
+            return
 
         # PRIORITY ORDER FIX (FOOTWEAR FIRST)
         if _contains_word(category, ["shoe", "footwear", "sneaker", "heel", "boot", "sandal"]):
             parts["shoes"].append(_normalize_item(raw, "shoes"))
+        elif _contains_word(category, ["dress", "gown", "onepiece", "one-piece", "jumpsuit"]):
+            parts["dresses"].append(_normalize_item(raw, "dress"))
+        elif _contains_word(category, ["accessory", "jewelry", "jewellery", "bag", "watch", "belt", "scarf", "hat"]):
+            parts["accessories"].append(_normalize_item(raw, "accessory"))
 
         elif _contains_word(category, ["bottom", "jean", "pant", "trouser", "skirt", "short"]):
             parts["bottoms"].append(_normalize_item(raw, "bottom"))
@@ -182,6 +195,12 @@ def _normalize_wardrobe(raw_wardrobe: Any) -> Dict[str, List[Dict[str, Any]]]:
             if isinstance(item, dict):
                 _add(item)
         for item in raw_wardrobe.get("outerwear", []) or []:
+            if isinstance(item, dict):
+                _add(item)
+        for item in raw_wardrobe.get("dresses", []) or []:
+            if isinstance(item, dict):
+                _add(item)
+        for item in raw_wardrobe.get("accessories", raw_wardrobe.get("jewelry", [])) or []:
             if isinstance(item, dict):
                 _add(item)
     elif isinstance(raw_wardrobe, list):
@@ -277,6 +296,8 @@ def _merge_wardrobe(
         "bottoms": list(base.get("bottoms", [])),
         "shoes": list(base.get("shoes", [])),
         "outerwear": list(base.get("outerwear", [])),
+        "dresses": list(base.get("dresses", [])),
+        "accessories": list(base.get("accessories", [])),
     }
 
     seen = set()
@@ -300,12 +321,231 @@ def _merge_wardrobe(
         elif _contains_word(item_type, ["outer", "jacket", "coat", "blazer", "hoodie"]):
             merged["outerwear"].append(item)
 
+        elif _contains_word(item_type, ["dress", "gown", "onepiece", "one-piece", "jumpsuit"]):
+            merged["dresses"].append(item)
+
+        elif _contains_word(item_type, ["accessory", "jewel", "bag", "watch", "belt", "scarf", "hat"]):
+            merged["accessories"].append(item)
+
         elif _contains_word(item_type, ["top", "shirt", "tee", "blouse", "sweater"]):
             merged["tops"].append(item)
 
         seen.add(item_id)
 
     return merged
+
+
+def _occasion_filter(wardrobe: Dict[str, List[Dict[str, Any]]], occasion: str) -> Dict[str, List[Dict[str, Any]]]:
+    occ = str(occasion or "").strip().lower()
+    if not occ:
+        return wardrobe
+
+    filtered: Dict[str, List[Dict[str, Any]]] = {}
+    for key, items in wardrobe.items():
+        matched = []
+        for item in items or []:
+            tags = [str(v).strip().lower() for v in (item.get("occasion_tags") or []) if str(v).strip()]
+            if occ in tags or any(occ in t for t in tags):
+                matched.append(item)
+        filtered[key] = matched if matched else list(items or [])
+    return filtered
+
+
+def _master_piece_score(item: Dict[str, Any], occasion: str, semantic_map: Dict[str, float]) -> float:
+    tags = [str(v).strip().lower() for v in (item.get("occasion_tags") or []) if str(v).strip()]
+    score = 0.0
+    if occasion and (occasion in tags or any(occasion in t for t in tags)):
+        score += 2.0
+    item_id = str(item.get("id", "")).strip()
+    if item_id:
+        score += float(semantic_map.get(item_id, 0.0))
+    return score
+
+
+def _pick_master_piece(
+    wardrobe: Dict[str, List[Dict[str, Any]]],
+    occasion: str,
+    semantic_map: Dict[str, float],
+) -> Tuple[str, Dict[str, Any]]:
+    candidates: List[Tuple[str, Dict[str, Any], float]] = []
+    for row in wardrobe.get("tops", []) or []:
+        candidates.append(("top", row, _master_piece_score(row, occasion, semantic_map)))
+    for row in wardrobe.get("dresses", []) or []:
+        candidates.append(("dress", row, _master_piece_score(row, occasion, semantic_map) + 0.1))
+
+    if not candidates:
+        return "", {}
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    best = candidates[0]
+    return best[0], best[1]
+
+
+def _build_master_combos(
+    wardrobe: Dict[str, List[Dict[str, Any]]],
+    master_type: str,
+    master_item: Dict[str, Any],
+    *,
+    max_combos: int = 36,
+) -> List[Dict[str, Any]]:
+    combos: List[Dict[str, Any]] = []
+    if master_type == "top":
+        for bottom in (wardrobe.get("bottoms", []) or []):
+            for shoe in (wardrobe.get("shoes", []) or []):
+                combos.append(
+                    {
+                        "combo_id": f"{master_item.get('id')}|{bottom.get('id')}|{shoe.get('id')}",
+                        "master_type": "top",
+                        "master_piece": master_item,
+                        "top": master_item,
+                        "bottom": bottom,
+                        "shoes": shoe,
+                        "dress": {},
+                        "outerwear": {},
+                        "accessories": [],
+                    }
+                )
+                if len(combos) >= max_combos:
+                    return combos
+    elif master_type == "dress":
+        for shoe in (wardrobe.get("shoes", []) or []):
+            combos.append(
+                {
+                    "combo_id": f"{master_item.get('id')}|{shoe.get('id')}",
+                    "master_type": "dress",
+                    "master_piece": master_item,
+                    "top": {},
+                    "bottom": {},
+                    "shoes": shoe,
+                    "dress": master_item,
+                    "outerwear": {},
+                    "accessories": [],
+                }
+            )
+            if len(combos) >= max_combos:
+                return combos
+    return combos
+
+
+def _combo_palette(combo: Dict[str, Any]) -> List[str]:
+    colors: List[str] = []
+    for part in ("master_piece", "top", "bottom", "shoes", "dress"):
+        item = combo.get(part, {}) or {}
+        color = str(item.get("color", "")).strip().lower()
+        if color:
+            colors.append(color)
+    return colors
+
+
+def _combo_patterns(combo: Dict[str, Any]) -> List[str]:
+    patterns: List[str] = []
+    for part in ("master_piece", "top", "bottom", "shoes", "dress"):
+        item = combo.get(part, {}) or {}
+        p = str(item.get("fabric", "")).strip().lower()
+        if p:
+            patterns.append(p)
+    return patterns
+
+
+def _llm_filter_combo_ids(
+    *,
+    occasion: str,
+    stage: str,
+    master_type: str,
+    master_piece: Dict[str, Any],
+    combos: List[Dict[str, Any]],
+) -> List[str]:
+    if not combos:
+        return []
+
+    compact = []
+    for row in combos:
+        compact.append(
+            {
+                "combo_id": row.get("combo_id"),
+                "palette": _combo_palette(row),
+                "patterns": _combo_patterns(row),
+                "bottom": (row.get("bottom") or {}).get("name"),
+                "shoes": (row.get("shoes") or {}).get("name"),
+                "dress": (row.get("dress") or {}).get("name"),
+            }
+        )
+
+    prompt = f"""
+You are a fashion combo evaluator.
+Occasion: {occasion}
+Stage: {stage}
+Master type: {master_type}
+Master piece: {json.dumps({'name': master_piece.get('name'), 'color': master_piece.get('color'), 'fabric': master_piece.get('fabric')}, ensure_ascii=True)}
+
+Select best combo_ids from this list:
+{json.dumps(compact, ensure_ascii=True)}
+
+Return strict JSON object:
+{{
+  "selected_combo_ids": ["id1","id2","id3"]
+}}
+Rules:
+- Keep at most 8 ids.
+- Keep only ids present in the input.
+- Prioritize practical wearable harmony.
+"""
+    try:
+        parsed = ai_gateway.generate_json_object(prompt, signals={"context_mode": "styling"})
+        selected = parsed.get("selected_combo_ids", []) if isinstance(parsed, dict) else []
+        normalized = []
+        valid = {str(c.get("combo_id")) for c in compact}
+        for value in selected if isinstance(selected, list) else []:
+            cid = str(value).strip()
+            if cid and cid in valid and cid not in normalized:
+                normalized.append(cid)
+        return normalized[:8]
+    except Exception:
+        return []
+
+
+def _rule_color_fallback(master_piece: Dict[str, Any], combos: List[Dict[str, Any]]) -> List[str]:
+    master_color = str((master_piece or {}).get("color", "")).strip().lower()
+    neutrals = {"black", "white", "beige", "gray", "grey", "navy", "brown"}
+    selected: List[str] = []
+    for combo in combos:
+        palette = _combo_palette(combo)
+        uniq = set(palette)
+        if not uniq:
+            continue
+        if master_color and master_color in uniq:
+            selected.append(str(combo.get("combo_id")))
+            continue
+        if len(uniq) <= 3 and any(c in neutrals for c in uniq):
+            selected.append(str(combo.get("combo_id")))
+    return selected[:8]
+
+
+def _rule_pattern_fallback(combos: List[Dict[str, Any]]) -> List[str]:
+    selected: List[str] = []
+    for combo in combos:
+        pats = [p for p in _combo_patterns(combo) if p]
+        if not pats:
+            selected.append(str(combo.get("combo_id")))
+            continue
+        standout = sum(1 for p in pats if p in {"striped", "checked", "floral", "printed"})
+        if standout <= 1:
+            selected.append(str(combo.get("combo_id")))
+    return selected[:8]
+
+
+def _select_accessories(wardrobe: Dict[str, List[Dict[str, Any]]], combo: Dict[str, Any], limit: int = 2) -> List[Dict[str, Any]]:
+    accessories = wardrobe.get("accessories", []) or []
+    if not accessories:
+        return []
+    palette = set(_combo_palette(combo))
+    picked: List[Dict[str, Any]] = []
+    for item in accessories:
+        color = str(item.get("color", "")).strip().lower()
+        if color and color in palette:
+            picked.append(item)
+        if len(picked) >= limit:
+            return picked
+    return accessories[:limit]
 
 
 def generate_combinations(wardrobe: Dict[str, List[Dict[str, Any]]], max_candidates: int = 600) -> List[Dict[str, Any]]:
@@ -355,7 +595,7 @@ def _similarity_score(outfit_a: Dict[str, Any], outfit_b: Dict[str, Any]) -> flo
         return 0.0
     score = 0.0
     checks = 0
-    for part in ("top", "bottom", "shoes", "outerwear"):
+    for part in ("top", "bottom", "dress", "shoes", "outerwear"):
         a = outfit_a.get(part, {}) or {}
         b = outfit_b.get(part, {}) or {}
         if not a or not b:
@@ -413,7 +653,7 @@ def score_outfit(
     colors = []
     item_ids = []
 
-    for part in ("top", "bottom", "shoes", "outerwear"):
+    for part in ("master_piece", "top", "bottom", "dress", "shoes", "outerwear"):
         item = outfit.get(part, {}) or {}
         if not item:
             continue
@@ -508,15 +748,26 @@ def score_outfit(
 def _explanation_for_outfit(outfit: Dict[str, Any], context: Dict[str, Any]) -> str:
     top = outfit.get("top", {}) or {}
     bottom = outfit.get("bottom", {}) or {}
+    dress = outfit.get("dress", {}) or {}
     shoes = outfit.get("shoes", {}) or {}
     outer = outfit.get("outerwear", {}) or {}
+    accessories = outfit.get("accessories", []) or []
+    master_type = str(outfit.get("master_type", "")).lower()
 
-    lines = [
-        f"Occasion fit: {context.get('occasion', 'daily')} look built with {top.get('name', 'top')} and {bottom.get('name', 'bottom')}.",
-        f"Color intelligence: {top.get('color', 'neutral')} balances with {bottom.get('color', 'neutral')} and {shoes.get('color', 'neutral')}.",
-    ]
+    if master_type == "dress" or dress:
+        lines = [
+            f"Occasion fit: {context.get('occasion', 'daily')} look anchored by {dress.get('name', 'dress')}.",
+            f"Color harmony: {dress.get('color', 'neutral')} pairs with {shoes.get('color', 'neutral')} footwear.",
+        ]
+    else:
+        lines = [
+            f"Occasion fit: {context.get('occasion', 'daily')} look built with {top.get('name', 'top')} and {bottom.get('name', 'bottom')}.",
+            f"Color harmony: {top.get('color', 'neutral')} balances with {bottom.get('color', 'neutral')} and {shoes.get('color', 'neutral')}.",
+        ]
     if outer:
         lines.append(f"Layering: {outer.get('name', 'outerwear')} adds weather-ready structure.")
+    if accessories:
+        lines.append(f"Accessories: {', '.join(str(x.get('name', 'accent')) for x in accessories)} complete the style board.")
     lines.append("Personalization: ranking boosted using your Style DNA, memory, and feedback signals.")
     return " ".join(lines)
 
@@ -534,16 +785,24 @@ def _story_title(score: float) -> str:
 def _generate_story(outfit: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     top = outfit.get("top", {}) or {}
     bottom = outfit.get("bottom", {}) or {}
+    dress = outfit.get("dress", {}) or {}
     shoes = outfit.get("shoes", {}) or {}
     outer = outfit.get("outerwear", {}) or {}
+    master_type = str(outfit.get("master_type", "")).lower()
 
     setting = str(context.get("occasion") or "the day").replace("_", " ")
     weather = str(context.get("weather") or "today")
 
-    narrative = (
-        f"For {setting}, start with {top.get('name', 'a top')} to set the tone, "
-        f"ground it with {bottom.get('name', 'a bottom')}, and finish with {shoes.get('name', 'your shoes')}."
-    )
+    if master_type == "dress" or dress:
+        narrative = (
+            f"For {setting}, anchor the look with {dress.get('name', 'a dress')} and finish with "
+            f"{shoes.get('name', 'your shoes')}."
+        )
+    else:
+        narrative = (
+            f"For {setting}, start with {top.get('name', 'a top')} to set the tone, "
+            f"ground it with {bottom.get('name', 'a bottom')}, and finish with {shoes.get('name', 'your shoes')}."
+        )
     if outer:
         narrative += f" Add {outer.get('name', 'an outer layer')} for {weather} comfort and extra polish."
 
@@ -562,25 +821,29 @@ def _build_tryon_payload(outfit: Dict[str, Any], context: Dict[str, Any]) -> Dic
 
     top_id = _safe_id((outfit.get("top") or {}).get("id"))
     bottom_id = _safe_id((outfit.get("bottom") or {}).get("id"))
+    dress_id = _safe_id((outfit.get("dress") or {}).get("id"))
     shoes_id = _safe_id((outfit.get("shoes") or {}).get("id"))
     outerwear_id = _safe_id((outfit.get("outerwear") or {}).get("id"))
 
-    # Try-on requires a complete base silhouette.
+    # Try-on supports either top+bottom+shoes or dress+shoes.
     if not (top_id and bottom_id and shoes_id):
-        return {}
+        if not (dress_id and shoes_id):
+            return {}
 
-    return {
+    payload = {
         "mode": "virtual_try_on",
         "occasion": context.get("occasion"),
         "weather": context.get("weather"),
         "items": {
             "top_id": top_id,
             "bottom_id": bottom_id,
+            "dress_id": dress_id,
             "shoes_id": shoes_id,
             "outerwear_id": outerwear_id,
         },
         "prompt": f"Try on this look for {context.get('occasion', 'daily wear')}.",
     }
+    return payload
 
 
 def _build_cards(outfits: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -588,18 +851,19 @@ def _build_cards(outfits: List[Dict[str, Any]], context: Dict[str, Any]) -> List
     for idx, outfit in enumerate(outfits):
         story = _generate_story(outfit, context)
         tryon_payload = _build_tryon_payload(outfit, context)
+        items = []
+        for part in ("top", "bottom", "dress", "shoes", "outerwear"):
+            value = outfit.get(part, {}) or {}
+            if value:
+                items.append(value)
+        items.extend([x for x in (outfit.get("accessories") or []) if isinstance(x, dict)])
         cards.append(
             {
                 "id": f"outfit_card_{idx + 1}",
                 "title": story.get("title"),
                 "score": outfit.get("rank_score", outfit.get("score", 0.0)),
                 "ml_score": outfit.get("ml_score", 0.0),
-                "items": [
-                    outfit.get("top", {}),
-                    outfit.get("bottom", {}),
-                    outfit.get("shoes", {}),
-                    outfit.get("outerwear", {}),
-                ],
+                "items": items,
                 "explanation": story.get("why_it_works"),
                 "story": story,
                 "tryon_payload": tryon_payload,
@@ -642,42 +906,105 @@ def get_daily_outfits(user: Dict[str, Any]) -> Dict[str, Any]:
     normalized = _normalize_wardrobe(raw_wardrobe)
     semantic_items, semantic_map = _semantic_retrieval(user_id=user_id, context=context)
     wardrobe = _merge_wardrobe(normalized, semantic_items)
+    occasion = str(context.get("occasion", "")).strip().lower()
 
-    if not wardrobe["tops"] or not wardrobe["bottoms"] or not wardrobe["shoes"]:
+    if not occasion:
         return {
             "intent": "daily_outfit",
-            "context": "Not enough wardrobe data. Need tops, bottoms, and shoes.",
+            "context": "Need occasion clarification before styling.",
             "outfits": [],
             "cards": [],
             "boards": [],
             "normalized_wardrobe": wardrobe,
             "pipeline": {
                 "stages": [
-                    "semantic_retrieval",
-                    "outfit_generation",
-                    "scoring",
-                    "explanations",
-                    "tryon_payload",
-                    "frontend",
+                    "clarifying_questions",
+                    "occasion_intent_capture",
+                ]
+            },
+            "clarifying_questions": [
+                "Which occasion is this for?",
+                "Do you want an outfit around a top or a dress?",
+            ],
+        }
+
+    occasion_filtered = _occasion_filter(wardrobe, occasion)
+    master_type, master_piece = _pick_master_piece(occasion_filtered, occasion, semantic_map)
+    if not master_piece:
+        return {
+            "intent": "daily_outfit",
+            "context": f"No suitable top or dress found for occasion '{occasion}'.",
+            "outfits": [],
+            "cards": [],
+            "boards": [],
+            "normalized_wardrobe": wardrobe,
+            "pipeline": {
+                "stages": [
+                    "occasion_intent_capture",
+                    "occasion_wardrobe_filter",
+                    "master_piece_selection",
                 ]
             },
         }
 
+    combinations = _build_master_combos(occasion_filtered, master_type, master_piece, max_combos=40)
+    if not combinations:
+        msg = "Need bottoms + footwear for top-based styling." if master_type == "top" else "Need footwear for dress-based styling."
+        return {
+            "intent": "daily_outfit",
+            "context": msg,
+            "outfits": [],
+            "cards": [],
+            "boards": [],
+            "normalized_wardrobe": wardrobe,
+            "pipeline": {
+                "stages": [
+                    "occasion_intent_capture",
+                    "occasion_wardrobe_filter",
+                    "master_piece_selection",
+                    "combo_construction",
+                ]
+            },
+        }
+
+    color_keep = _llm_filter_combo_ids(
+        occasion=occasion,
+        stage="color_combo",
+        master_type=master_type,
+        master_piece=master_piece,
+        combos=combinations,
+    )
+    if not color_keep:
+        color_keep = _rule_color_fallback(master_piece, combinations)
+    color_filtered = [c for c in combinations if str(c.get("combo_id")) in set(color_keep)] or combinations[:8]
+
+    pattern_keep = _llm_filter_combo_ids(
+        occasion=occasion,
+        stage="pattern_combo",
+        master_type=master_type,
+        master_piece=master_piece,
+        combos=color_filtered,
+    )
+    if not pattern_keep:
+        pattern_keep = _rule_pattern_fallback(color_filtered)
+    pattern_filtered = [c for c in color_filtered if str(c.get("combo_id")) in set(pattern_keep)] or color_filtered[:5]
+
     merged_context = dict(context)
     merged_context["style_dna"] = style_dna
     merged_context["style_graph"] = style_graph_engine.build_graph(wardrobe)
-
     rules = style_engine.get_scoring_rules(style_dna, merged_context)
-    combinations = generate_combinations(wardrobe)
 
     with _MEMORY_LOCK:
         user_memory = _load_user_memory(user_id)
 
-        scored = [
-            score_outfit(combo, merged_context, user_memory, rules, semantic_map)
-            for combo in combinations
-            if validate_outfit(combo, merged_context)
-        ]
+        scored = []
+        for combo in pattern_filtered:
+            combo["accessories"] = _select_accessories(occasion_filtered, combo, limit=2)
+            scored_combo = score_outfit(combo, merged_context, user_memory, rules, semantic_map)
+            scored_combo["master_type"] = master_type
+            scored_combo["master_piece"] = master_piece
+            scored_combo["pipeline_tags"] = ["occasion_filtered", "master_piece", "llm_color", "llm_pattern", "accessories"]
+            scored.append(scored_combo)
 
         ranked = outfit_ranker.rank(user_id=user_id, outfits=scored, top_n=3)
 
@@ -693,14 +1020,18 @@ def get_daily_outfits(user: Dict[str, Any]) -> Dict[str, Any]:
     board_item_ids: List[str] = []
     if ranked:
         best = ranked[0]
-        for part in ("top", "bottom", "shoes", "outerwear"):
+        for part in ("top", "bottom", "dress", "shoes", "outerwear"):
             item_id = str((best.get(part) or {}).get("id", "")).strip()
+            if item_id:
+                board_item_ids.append(item_id)
+        for item in (best.get("accessories") or []):
+            item_id = str((item or {}).get("id", "")).strip()
             if item_id:
                 board_item_ids.append(item_id)
 
     return {
         "intent": "daily_outfit",
-        "context": "Generated via semantic retrieval, ML ranking, personalization, and explanation pipeline.",
+        "context": "Generated with occasion filtering, master-piece selection, LLM color/pattern filtering, and accessory completion.",
         "outfits": ranked,
         "cards": cards,
         "boards": cards,
@@ -708,8 +1039,14 @@ def get_daily_outfits(user: Dict[str, Any]) -> Dict[str, Any]:
         "normalized_wardrobe": wardrobe,
         "pipeline": {
             "stages": [
-                "semantic_retrieval",
-                "outfit_generation",
+                "clarifying_questions_if_needed",
+                "occasion_intent_capture",
+                "occasion_wardrobe_filter",
+                "master_piece_selection",
+                "llm_color_combo_filter",
+                "llm_pattern_combo_filter",
+                "accessory_completion",
+                "style_board_generation",
                 "scoring_engine",
                 "explanation_generation",
                 "tryon_payload",

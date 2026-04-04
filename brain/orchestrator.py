@@ -355,7 +355,12 @@ class AhviOrchestrator:
                 signals=signals,
             )
         else:
-            message = "I need more wardrobe items to generate outfits."
+            questions = pipeline_result.get("clarifying_questions", []) if isinstance(pipeline_result, dict) else []
+            if questions:
+                message = "I need one quick detail before styling: " + str(questions[0])
+                cards = [{"title": "Clarify Occasion", "kind": "question", "question": str(q)} for q in questions[:3]]
+            else:
+                message = "I need more wardrobe items to generate outfits."
 
         response = {
             "success": True,

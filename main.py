@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Callable
+from typing import Any, Dict
 from uuid import uuid4
 from time import perf_counter
 
@@ -69,9 +70,10 @@ vision_router = None
 if os.getenv("ENABLE_VISION", "false").lower() in ("1", "true", "yes"):
     if all(_has_module(m) for m in ["cv2", "sklearn", "numpy"]):
         vision_router = _load_optional_router("routers.vision")
+
 wardrobe_capture_router = None
 if os.getenv("ENABLE_VISION", "false").lower() in ("1", "true", "yes"):
-    if all(_has_module(m) for m in ["cv2", "numpy", "PIL"]):
+    if all(_has_module(m) for m in ["numpy", "PIL"]):
         wardrobe_capture_router = _load_optional_router("routers.wardrobe_capture")
 
 garment_router = None
@@ -418,8 +420,7 @@ if reddit_router:
 
 if vision_router:
     app.include_router(vision_router, prefix="/api/vision")
-    # Backward-compatible alias for older clients still using /api/analyze-image.
-    app.include_router(vision_router, prefix="/api")
+
 if wardrobe_capture_router:
     app.include_router(wardrobe_capture_router)
 
@@ -480,6 +481,104 @@ def remove_bg_compat(payload: BgCompatRequest):
         },
     )
     return result
+
+
+class VisionCompatRequest(BaseModel):
+    image_base64: str = Field(..., min_length=20)
+    user_id: str | None = None
+    userId: str | None = None
+
+
+@app.post("/api/analyze-image")
+@app.post("/api/vision/analyze-image")
+@app.post("/api/vision/analyze")
+@app.post("/api/analyze")
+def analyze_compat(payload: VisionCompatRequest):
+    """
+    Backward-compatible image analysis endpoints expected by older frontend builds.
+    """
+    try:
+        from routers.vision import vision_analyze_core
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Analyze endpoint unavailable: {exc}")
+
+    user_id = str(payload.user_id or payload.userId or "demo_user").strip() or "demo_user"
+    try:
+        core = vision_analyze_core(payload.image_base64, user_id)
+    except Exception as exc:
+        user_input_payload = {
+            "name": "",
+            "category": "",
+            "sub_category": "",
+            "pattern": "",
+            "occasions": [],
+            "color_code": "",
+        }
+        return {
+            "success": False,
+            "requires_user_input": True,
+            "message": "Vision model unavailable. Please enter item details manually.",
+            "data": user_input_payload,
+            "items": [
+                {
+                    "id": "manual-input-required",
+                    **user_input_payload,
+                }
+            ],
+            "similar_items": [],
+            "duplicate": {"is_duplicate": False, "id": None, "score": 0.0},
+            "meta": {
+                "llm_only": True,
+                "vision_model_used": None,
+                "analysis_source": "manual_input_required",
+                "ollama_error": str(exc),
+            },
+            "questions": [
+                "What is the garment type (top, bottom, dress, footwear, accessory)?",
+                "What is the sub-category (for example trousers, shirt, sneakers)?",
+                "What is the primary color and pattern?",
+                "Which occasions does this item fit?",
+            ],
+        }
+
+    if not isinstance(core, dict):
+        raise HTTPException(status_code=502, detail="Vision analyzer returned invalid payload")
+
+    analysis = core.get("data") if isinstance(core.get("data"), dict) else {}
+    meta = core.get("meta") if isinstance(core.get("meta"), dict) else {}
+    similar_items = core.get("similar_items") if isinstance(core.get("similar_items"), list) else []
+    duplicate = {
+        "is_duplicate": bool(meta.get("probable_duplicate")),
+        "id": meta.get("image_duplicate_point_id") or meta.get("pixel_duplicate_point_id"),
+        "score": float(meta.get("top_similarity_score") or meta.get("image_duplicate_score") or 0.0),
+    }
+
+    return {
+        "success": True,
+        "data": analysis,
+        "processed_image_base64": core.get("processed_image_base64") or payload.image_base64,
+        "items": [
+            {
+                "id": str(analysis.get("name") or "item"),
+                "name": analysis.get("name"),
+                "category": analysis.get("category"),
+                "sub_category": analysis.get("sub_category"),
+                "color_code": analysis.get("color_code"),
+                "pattern": analysis.get("pattern"),
+                "occasions": analysis.get("occasions", []),
+            }
+        ],
+        "similar_items": similar_items,
+        "duplicate": duplicate,
+        "meta": {
+            "vision_model_used": meta.get("vision_model_used"),
+            "duplicate_threshold": meta.get("duplicate_threshold"),
+            "llm_only": True,
+            "analysis_source": "ollama",
+            "llm_fallback": bool(meta.get("llm_fallback")),
+            "bg_removed": meta.get("bg_removed"),
+        },
+    }
 @app.get("/")
 def root():
     return {"message": "AHVI backend running"}
