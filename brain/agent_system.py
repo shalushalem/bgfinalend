@@ -1,7 +1,8 @@
 from typing import Any, Dict, List
 import logging
 
-from services.ai_gateway import generate_text, parse_json_array
+# FIX: Import extract_json instead of strict parse_json_array
+from services.ai_gateway import generate_text, extract_json
 
 
 class AgentSystem:
@@ -29,9 +30,19 @@ class AgentSystem:
             return []
 
         try:
-            parsed = parse_json_array(str(response))
+            # FIX: Use extract_json to handle both arrays and wrapped objects safely
+            parsed = extract_json(str(response))
+            
+            # Scenario A: The AI correctly returned a list
             if isinstance(parsed, list):
                 return parsed
+                
+            # Scenario B: The AI wrapped the list in a dict (e.g. {"steps": [...]})
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if isinstance(value, list):
+                        return value
+                        
         except Exception:
             logging.exception("Invalid LLM plan JSON")
 
@@ -47,11 +58,11 @@ Your job:
 Return a JSON list of steps to execute.
 
 Rules:
-- Output ONLY valid JSON
-- No explanation
+- Output ONLY a valid JSON array. DO NOT wrap it in a JSON object.
+- No explanation or markdown
 - Each step must have:
-  - step
-  - agent
+  - "step"
+  - "agent"
 
 Available steps:
 - normalize_context

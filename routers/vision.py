@@ -256,7 +256,7 @@ def _build_smart_fallback(color_hex: str, hint_category: str = "Tops", hint_sub_
         "name": f"{color_name} {hint_sub_category}",
         "category": hint_category,
         "sub_category": hint_sub_category,
-        "occasions": ["casual", "office"],
+        "occasions": ["casual", "office", "brunch", "night out", "weekend", "everyday wear", "vacation"],
         "pattern": "plain",
     }
 
@@ -410,7 +410,8 @@ def _shape_vision_output(raw_data, color_hex: str, hint_category: str, hint_sub_
     category = _clean_text(data.get("category") or data.get("main_category") or data.get("type"))
     sub_category = _clean_text(data.get("sub_category") or data.get("subcategory") or data.get("subType"))
     pattern = _clean_text(data.get("pattern") or data.get("texture"))
-    occasions = _normalize_occasions(data.get("occasions") or data.get("occasion"))
+    raw_occ = data.get("occasions") or data.get("occasion") or data.get("Occasions") or data.get("wear_to")
+    occasions = _normalize_occasions(raw_occ)
 
     canonical_category = _canonicalize_category(category, sub_category, name, hint_category)
     if not sub_category:
@@ -421,7 +422,7 @@ def _shape_vision_output(raw_data, color_hex: str, hint_category: str, hint_sub_
     if not pattern:
         pattern = _infer_pattern(cv_image)
     if not occasions:
-        occasions = ["casual", "office"]
+        occasions = ["casual", "office", "brunch", "night out", "weekend", "everyday wear", "vacation"]
 
     data["name"] = name
     data["category"] = canonical_category

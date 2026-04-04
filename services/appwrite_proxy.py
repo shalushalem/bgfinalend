@@ -87,7 +87,6 @@ class AppwriteProxy:
             "jobs": os.getenv("APPWRITE_COLLECTION_JOBS", "") or os.getenv("EXPO_PUBLIC_APPWRITE_COLLECTION_JOBS", ""),
         }
         self.resource_aliases = {
-            # Organize module keys -> Appwrite resource keys
             "meal_planner": "meal_plans",
             "meal": "meal_plans",
             "medicines": "meds",
@@ -155,8 +154,6 @@ class AppwriteProxy:
 
     @staticmethod
     def _serialize_query_token(token: Any) -> str:
-        # Appwrite 1.9 expects query objects in the REST API.
-        # Keep string support for backward compatibility with older deployments.
         if isinstance(token, dict):
             return json.dumps(token, separators=(",", ":"), ensure_ascii=False)
         return str(token)
@@ -187,7 +184,6 @@ class AppwriteProxy:
                 or os.getenv(f"EXPO_PUBLIC_APPWRITE_COLLECTION_{env_suffix}", "")
             )
         if not collection_id:
-            # Final fallback: allow resource name to be used directly as collection id.
             collection_id = resource
         if not collection_id:
             raise AppwriteProxyError(f"Unknown or unconfigured resource: {resource}")
@@ -260,7 +256,6 @@ class AppwriteProxy:
         for idx, token in enumerate(serialized_tokens):
             indexed_queries[f"queries[{idx}]"] = token
 
-        # Prefer query operator syntax (supports filters/order). Fallback to plain params.
         param_candidates: List[Dict[str, Any]] = [
             {"queries[]": serialized_tokens},
             {"queries": serialized_tokens},
@@ -437,6 +432,18 @@ class AppwriteProxy:
             docs = fallback.get("documents", [])
             has_more = bool(fallback.get("has_more"))
             next_offset = fallback.get("next_offset")
+            
+            # --- DEBUG BLOCK FOR FALLBACK SCAN ---
+            if resource == "outfits":
+                print("\n=== WARDROBE FETCH DEBUG (FALLBACK MODE) ===")
+                print(f"User ID Searched: {user_id}")
+                print(f"Collection ID Used: {collection_id}")
+                print(f"Total Items Found For You: {len(docs)}")
+                if len(docs) > 0:
+                    print(f"Sample Item Found: {docs[0].get('name')} - {docs[0].get('category')}")
+                print("============================================\n")
+            # -------------------------------------
+            
             payload = {
                 "documents": docs,
                 "meta": {
@@ -462,6 +469,17 @@ class AppwriteProxy:
 
         if has_more:
             next_offset = safe_offset + len(docs)
+
+        # --- DEBUG BLOCK FOR STANDARD QUERY ---
+        if resource == "outfits":
+            print("\n=== WARDROBE FETCH DEBUG (STANDARD QUERY) ===")
+            print(f"User ID Searched: {user_id}")
+            print(f"Collection ID Used: {collection_id}")
+            print(f"Total Items Found For You: {len(docs)}")
+            if len(docs) > 0:
+                print(f"Sample Item Found: {docs[0].get('name')} - {docs[0].get('category')}")
+            print("=============================================\n")
+        # --------------------------------------
 
         payload = {
             "documents": docs,

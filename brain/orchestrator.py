@@ -59,7 +59,6 @@ class AhviOrchestrator:
         appwrite = AppwriteProxy()
 
         try:
-            # Fast-path organize entry for chat-open UX.
             early_organize = self._resolve_organize_request(text=text, context=context, slots={}, intent="general")
             if early_organize.get("active") and ("organize" in str(text or "").lower() or "organize" in str(context.get("module_context") or "").lower()):
                 return self._finalize_response(
@@ -90,6 +89,7 @@ class AhviOrchestrator:
                 return self._finalize_response({
                     "success": True,
                     "request_id": request_id,
+                    "meta": {"intent": "daily_dependency", "domain": "planning"},
                     **build_daily_dependency_response(
                         user_id=user_id,
                         context=context,
@@ -97,9 +97,6 @@ class AhviOrchestrator:
                     ),
                 }, request_id=request_id)
 
-            # -------------------------
-            # INTENT ENGINE
-            # -------------------------
             intent_data = detect_intent(
                 text,
                 context.get("history"),
@@ -118,25 +115,16 @@ class AhviOrchestrator:
                     ),
                 }, request_id=request_id)
 
-            # -------------------------
-            # SLOT MERGE
-            # -------------------------
             fallback_slots = self._extract_slots(text=text, context=context)
             llm_slots = intent_data.get("slots", {}) or {}
             slots = {**fallback_slots, **llm_slots}
             intent_data["slots"] = slots
 
-            # -------------------------
-            # ðŸ”¥ SIGNALS (NEW)
-            # -------------------------
             signals = {
                 "context_mode": "styling",
                 "emotion_state": self._infer_emotion_state(text),
             }
 
-            # -------------------------
-            # TRY-ON FLOW
-            # -------------------------
             if intent == "try_on":
                 return self._finalize_response(
                     self._try_on_response(
@@ -148,9 +136,6 @@ class AhviOrchestrator:
                     request_id=request_id,
                 )
 
-            # -------------------------
-            # WARDROBE QUERY FLOW
-            # -------------------------
             if intent == "wardrobe_query" or self._is_wardrobe_count_query(text):
                 return self._finalize_response(
                     self._wardrobe_query_response(
@@ -162,9 +147,6 @@ class AhviOrchestrator:
                     request_id=request_id,
                 )
 
-            # -------------------------
-            # PLAN & PACK FLOW
-            # -------------------------
             if intent == "plan_pack" or self._is_plan_pack_request(text=text, context=context):
                 pp = build_plan_pack_response(text=text, context=context)
                 return self._finalize_response({
@@ -178,9 +160,6 @@ class AhviOrchestrator:
                     "data": pp.get("data", {}),
                 }, request_id=request_id)
 
-            # -------------------------
-            # ORGANIZE HUB FLOW
-            # -------------------------
             organize_signal = self._resolve_organize_request(text=text, context=context, slots=slots, intent=intent)
             if organize_signal.get("active"):
                 return self._finalize_response(
@@ -194,9 +173,6 @@ class AhviOrchestrator:
                     request_id=request_id,
                 )
 
-            # -------------------------
-            # STYLING FLOWS
-            # -------------------------
             if intent in ("daily_outfit", "occasion_outfit", "explore_styles"):
                 return self._finalize_response(
                     self._styling_response(
@@ -213,9 +189,6 @@ class AhviOrchestrator:
                     request_id=request_id,
                 )
 
-            # -------------------------
-            # FALLBACK
-            # -------------------------
             general_message = generate_text(
                 text,
                 user_profile=context.get("user_profile"),
@@ -254,7 +227,7 @@ class AhviOrchestrator:
         return validate_orchestrator_response(payload, request_id=request_id)
 
     # -------------------------
-    # HELPERS (UNCHANGED)
+    # HELPERS
     # -------------------------
     def _styling_response(
         self,
@@ -270,7 +243,8 @@ class AhviOrchestrator:
         started_at: float,
     ) -> Dict[str, Any]:
         try:
-            wardrobe_docs = appwrite.list_documents("outfits", user_id=user_id)
+            # FIX: Safely normalize the wardrobe immediately so it is an exact list of dicts
+            wardrobe_docs = self._normalize_documents(appwrite.list_documents("outfits", user_id=user_id))
             context["wardrobe"] = wardrobe_docs
         except Exception as e:
             logger.warning("orchestrator.wardrobe_fetch_failed request_id=%s error=%s", request_id, e)
@@ -309,6 +283,38 @@ class AhviOrchestrator:
         outfits = pipeline_result.get("outfits", [])
         boards = pipeline_result.get("boards", [])
         cards_from_pipeline = pipeline_result.get("cards", [])
+
+        # --- THE FOOLPROOF STYLING FALLBACK ---
+        # If the AI rejected the items and returned 0 outfits, manually build one!
+        if not outfits and context.get("wardrobe"):
+            safe_docs = self._normalize_documents(context.get("wardrobe"))
+            
+            def find_item(keywords):
+                for doc in safe_docs:
+                    cat = str(doc.get("category") or doc.get("type") or "").lower()
+                    sub = str(doc.get("sub_category") or "").lower()
+                    name = str(doc.get("name") or "").lower()
+                    blob = f"{cat} {sub} {name}"
+                    if any(k in blob for k in keywords):
+                        return doc
+                return {}
+
+            f_top = find_item(["top", "shirt", "blouse", "tee", "jacket", "hoodie"])
+            f_bottom = find_item(["bottom", "pant", "trouser", "jean", "skirt", "short"])
+            f_shoe = find_item(["shoe", "sneaker", "boot", "heel", "sandal", "footwear"])
+
+            if f_top and f_bottom:
+                fallback_outfit = {
+                    "combo_id": f"fallback_{f_top.get('$id')}_{f_bottom.get('$id')}",
+                    "master_type": "top",
+                    "top": f_top,
+                    "bottom": f_bottom,
+                    "shoes": f_shoe,
+                    "score": 8.5,
+                    "rank_score": 8.5,
+                }
+                outfits = [fallback_outfit]
+        # --------------------------------------
 
         fallback_depth = self._fallback_depth(context)
         if fallback_depth > 0:
@@ -411,10 +417,15 @@ class AhviOrchestrator:
 
         def _generate_score_rank():
             slots_ctx = enriched_context.get("slots", {}) or {}
+            
+            # FIX: Ensure we use the raw context wardrobe, since enriched_context was stripping it out!
+            raw_wardrobe = context.get("wardrobe") or enriched_context.get("wardrobe", [])
+            safe_wardrobe = self._normalize_documents(raw_wardrobe)
+
             state["pipeline_result"] = get_daily_outfits(
                 {
                     "user_id": user_id,
-                    "wardrobe": enriched_context.get("wardrobe", []),
+                    "wardrobe": safe_wardrobe,
                     "context": {
                         "query": text,
                         "weather": slots_ctx.get("weather"),
@@ -446,7 +457,7 @@ class AhviOrchestrator:
     def _persist_outfits(self, *, appwrite: AppwriteProxy, user_id: str, outfits: list, request_id: str = "") -> list[str]:
         saved_outfit_ids: list[str] = []
         try:
-            existing_outfits = self._safe_documents(appwrite.list_documents("outfits", user_id=user_id))
+            existing_outfits = self._normalize_documents(appwrite.list_documents("outfits", user_id=user_id))
             existing_hashes = {_hash_outfit(o) for o in existing_outfits}
         except Exception as e:
             logger.warning("orchestrator.outfits_load_failed request_id=%s error=%s", request_id, e)
@@ -529,27 +540,54 @@ class AhviOrchestrator:
         cards = pipeline.get("cards", []) if isinstance(pipeline, dict) else []
         top_card = {}
         tryon_payload = None
+
         for card in cards:
             if not isinstance(card, dict):
                 continue
             payload = card.get("tryon_payload")
             items = (payload or {}).get("items", {}) if isinstance(payload, dict) else {}
-            if (
-                isinstance(items, dict)
-                and str(items.get("top_id") or "").strip()
-                and str(items.get("bottom_id") or "").strip()
-                and str(items.get("shoes_id") or "").strip()
-            ):
+            
+            top_id = str(items.get("top_id") or "").strip()
+            bottom_id = str(items.get("bottom_id") or "").strip()
+            
+            if top_id and bottom_id:
                 top_card = card
                 tryon_payload = payload
                 break
+
+        # --- THE FOOLPROOF TRY-ON FALLBACK ---
+        if not tryon_payload:
+            def find_item_by_keywords(docs, keywords):
+                for doc in docs:
+                    cat = str(doc.get("category") or doc.get("type") or "").lower()
+                    sub = str(doc.get("sub_category") or "").lower()
+                    name = str(doc.get("name") or "").lower()
+                    blob = f"{cat} {sub} {name}"
+                    if any(k in blob for k in keywords):
+                        return doc.get("$id") or doc.get("id")
+                return None
+
+            fallback_top = find_item_by_keywords(wardrobe_docs, ["top", "shirt", "blouse", "tee", "t-shirt", "tshirt", "jacket", "blazer"])
+            fallback_bottom = find_item_by_keywords(wardrobe_docs, ["bottom", "pant", "trouser", "jean", "short", "skirt"])
+            fallback_shoes = find_item_by_keywords(wardrobe_docs, ["shoe", "sneaker", "heel", "boot", "sandal", "footwear"])
+
+            if fallback_top and fallback_bottom:
+                tryon_payload = {
+                    "items": {
+                        "top_id": fallback_top,
+                        "bottom_id": fallback_bottom,
+                        "shoes_id": fallback_shoes or ""
+                    }
+                }
+                cards = [{"title": "Try-On Ready", "tryon_payload": tryon_payload}]
+        # -------------------------------------
 
         if not tryon_payload:
             return {
                 "success": True,
                 "request_id": request_id,
                 "meta": {"intent": "try_on", "domain": "styling"},
-                "message": "I need at least one complete outfit before try-on. Add tops, bottoms, and shoes.",
+                "message": "I need at least one Top and one Bottom in your wardrobe before try-on.",
                 "board": "tryon",
                 "type": "tryon",
                 "cards": [],
@@ -597,7 +635,7 @@ class AhviOrchestrator:
             "data": {
                 "action": "open_tryon",
                 "tryon_payload": tryon_payload,
-                "board_item_ids": pipeline.get("board_item_ids", []),
+                "board_item_ids": pipeline.get("board_item_ids", []) if isinstance(pipeline, dict) else [],
             },
         }
 
@@ -912,8 +950,6 @@ Write a premium stylist response in 3-4 lines:
             }
 
         try:
-            # Chat module-open should show full board details for the selected module,
-            # not just a single preview card.
             docs_raw = appwrite.list_documents(resource, user_id=user_id, limit=50)
         except Exception:
             docs_raw = []

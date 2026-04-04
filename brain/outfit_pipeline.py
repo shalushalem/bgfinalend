@@ -20,8 +20,9 @@ _MEMORY_FILE = os.path.join(os.path.dirname(__file__), "data", "outfit_memory.js
 
 
 def _contains_word(text: str, words: List[str]) -> bool:
-    text = f" {str(text or '').lower()} "
-    return any(f" {w} " in text for w in words)
+    # FIX: Removed the strict space padding so "Tops" will successfully match "top" and "tops"
+    text = str(text or "").lower()
+    return any(w in text for w in words)
 
 
 def _utcnow_iso() -> str:
@@ -167,21 +168,18 @@ def _normalize_wardrobe(raw_wardrobe: Any) -> Dict[str, List[Dict[str, Any]]]:
             parts["accessories"].append(_normalize_item(raw, "accessory"))
             return
 
-        # PRIORITY ORDER FIX (FOOTWEAR FIRST)
-        if _contains_word(category, ["shoe", "footwear", "sneaker", "heel", "boot", "sandal"]):
+        # FIX: Added plurals (shoes, dresses, accessories, bottoms, outerwear, tops) to ensure matching
+        if _contains_word(category, ["shoe", "shoes", "footwear", "sneaker", "heel", "boot", "sandal"]):
             parts["shoes"].append(_normalize_item(raw, "shoes"))
-        elif _contains_word(category, ["dress", "gown", "onepiece", "one-piece", "jumpsuit"]):
+        elif _contains_word(category, ["dress", "dresses", "gown", "onepiece", "one-piece", "jumpsuit"]):
             parts["dresses"].append(_normalize_item(raw, "dress"))
-        elif _contains_word(category, ["accessory", "jewelry", "jewellery", "bag", "watch", "belt", "scarf", "hat"]):
+        elif _contains_word(category, ["accessory", "accessories", "jewelry", "jewellery", "bag", "watch", "belt", "scarf", "hat"]):
             parts["accessories"].append(_normalize_item(raw, "accessory"))
-
-        elif _contains_word(category, ["bottom", "jean", "pant", "trouser", "skirt", "short"]):
+        elif _contains_word(category, ["bottom", "bottoms", "jean", "pant", "pants", "trouser", "skirt", "short"]):
             parts["bottoms"].append(_normalize_item(raw, "bottom"))
-
-        elif _contains_word(category, ["outer", "jacket", "blazer", "coat", "hoodie"]):
+        elif _contains_word(category, ["outer", "outerwear", "jacket", "blazer", "coat", "hoodie"]):
             parts["outerwear"].append(_normalize_item(raw, "outerwear"))
-
-        elif _contains_word(category, ["top", "shirt", "tee", "blouse", "sweater"]):
+        elif _contains_word(category, ["top", "tops", "shirt", "tee", "blouse", "sweater"]):
             parts["tops"].append(_normalize_item(raw, "top"))
 
     if isinstance(raw_wardrobe, dict):
@@ -311,23 +309,18 @@ def _merge_wardrobe(
         if not item_id or item_id in seen:
             continue
 
-        # PRIORITY ORDER FIX
-        if _contains_word(item_type, ["shoe", "footwear", "sneaker", "boot", "heel", "sandal"]):
+        # FIX: Added plurals here as well
+        if _contains_word(item_type, ["shoe", "shoes", "footwear", "sneaker", "boot", "heel", "sandal"]):
             merged["shoes"].append(item)
-
-        elif _contains_word(item_type, ["bottom", "pant", "trouser", "jean", "skirt", "short"]):
+        elif _contains_word(item_type, ["bottom", "bottoms", "pant", "pants", "trouser", "jean", "skirt", "short"]):
             merged["bottoms"].append(item)
-
-        elif _contains_word(item_type, ["outer", "jacket", "coat", "blazer", "hoodie"]):
+        elif _contains_word(item_type, ["outer", "outerwear", "jacket", "coat", "blazer", "hoodie"]):
             merged["outerwear"].append(item)
-
-        elif _contains_word(item_type, ["dress", "gown", "onepiece", "one-piece", "jumpsuit"]):
+        elif _contains_word(item_type, ["dress", "dresses", "gown", "onepiece", "one-piece", "jumpsuit"]):
             merged["dresses"].append(item)
-
-        elif _contains_word(item_type, ["accessory", "jewel", "bag", "watch", "belt", "scarf", "hat"]):
+        elif _contains_word(item_type, ["accessory", "accessories", "jewel", "jewelry", "bag", "watch", "belt", "scarf", "hat"]):
             merged["accessories"].append(item)
-
-        elif _contains_word(item_type, ["top", "shirt", "tee", "blouse", "sweater"]):
+        elif _contains_word(item_type, ["top", "tops", "shirt", "tee", "blouse", "sweater"]):
             merged["tops"].append(item)
 
         seen.add(item_id)
