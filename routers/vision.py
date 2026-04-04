@@ -344,18 +344,32 @@ def _clean_text(value) -> str:
 
 
 def _canonicalize_category(category: str, sub_category: str, name: str, hint_category: str) -> str:
-    for candidate in (category, sub_category, name, hint_category):
+    candidates = [category, sub_category, name, hint_category]
+
+    # Pass 1: Try exact matches on ALL fields first (Safest)
+    for candidate in candidates:
         key = _clean_text(candidate).lower()
+        # Strip common broad taxonomies that confuse the categorizer
+        key = key.replace(" & accessories", "").replace(" and accessories", "")
+        
         if key in _CATEGORY_ALIASES:
             return _CATEGORY_ALIASES[key]
 
-        # Handle phrases like "black accessory" or "casual sneakers".
-        for token in key.replace("/", " ").replace("-", " ").split():
+    # Pass 2: Token-by-token matching ONLY if no exact match is found
+    for candidate in candidates:
+        key = _clean_text(candidate).lower()
+        tokens = key.replace("/", " ").replace("-", " ").split()
+
+        for token in tokens:
+            # Prevent "cap sleeve" from being marked as a hat (accessory)
+            if token == "cap" and "sleeve" in tokens:
+                continue
+                
             if token in _CATEGORY_ALIASES:
                 return _CATEGORY_ALIASES[token]
 
+    # Fallback to the hint category (Tops/Bottoms)
     return _CATEGORY_ALIASES.get(_clean_text(hint_category).lower(), "Tops")
-
 
 def _normalize_occasions(value) -> list[str]:
     if isinstance(value, list):
